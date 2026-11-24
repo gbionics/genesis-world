@@ -67,10 +67,10 @@ def test_contact_physical_parameter_gradients(
             differentiable_parameters=True,
         ),
     )
+    scene.build(n_envs=n_envs)
     # Soft contact keeps the inertial response and the inverse-weight regularization observable together.
     for geom in (*support.geoms, *robot.geoms):
         geom.set_sol_params(sol_params=[0.05, 1.0, 0.2, 0.2, 0.001, 0.5, 2.0])
-    scene.build(n_envs=n_envs)
     links_idx = (robot.get_link("rotor").idx_local,)
     parameters = robot.get_physical_parameters()
     geoms_idx = (0,)

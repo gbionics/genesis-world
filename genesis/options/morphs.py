@@ -1162,8 +1162,6 @@ class URDF(FileMorph):
                 gs.raise_exception("Differentiable URDF parameters require the imported link frames (`align=False`).")
             if not self.batch_fixed_verts:
                 gs.raise_exception("Differentiable URDF parameters require `batch_fixed_verts=True`.")
-            if self.enable_custom_vverts:
-                gs.raise_exception("Use `visual_offset` and `visual_scale` with differentiable URDF parameters.")
             self.align = False
 
     def is_format(self, format):

@@ -452,6 +452,7 @@ def test_render_bound_physical_parameters(renderer, resizable_urdf, show_viewer)
     )
     scene.build(n_envs=2)
     _, depth_before, seg_before, _ = camera.render(rgb=False, depth=True, segmentation=True)
+    scene.reset()
 
     visual_params = visual.get_physical_parameters()
     visual_scale = visual_params.visual_scale.new_tensor([[[2.0, 1.0, 1.0]], [[1.0, 1.0, 1.0]]])

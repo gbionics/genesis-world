@@ -427,6 +427,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             self._options.batch_links_info = True
             self._options.batch_dofs_info = True
         self._has_editable_parameters = has_editable_parameters
+        self._is_model_kinematics_unrecorded = False
 
         super().build(n_envs)
 
@@ -602,6 +603,15 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self._use_hibernation:
             self._hibernated_mass_mat_tracker = self.changelog.track(self.rigid_info.mass_mat, self.rigid_info.qpos)
 
+    def _read_data(self, data, envs_idx, idx, *, copy=None, is_batched=True):
+        # A refresh made while nothing was recorded left the poses on the bound model without a gradient to it, so the
+        # first recorded read refreshes them again as one operation of the rollout.
+        if self._is_model_kinematics_unrecorded and self.is_recording:
+            self._rollout_graph.run_call(
+                self, lambda solver, envs_idx: solver.refresh_forward_kinematics(envs_idx), (self._envs_idx,), {}
+            )
+        return super()._read_data(data, envs_idx, idx, copy=copy, is_batched=is_batched)
+
     def refresh_forward_kinematics(self, envs_idx: torch.Tensor | None) -> None:
         # The geoms are refreshed alongside the links, collision and ray casting reading the poses of the geoms
         if envs_idx is None:
@@ -611,6 +621,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         else:
             fn = kernel_forward_kinematics_links_geoms
         fn(envs_idx, self.dyn_state, self.dyn_info, self.rigid_info, self.rigid_config)
+        if self.is_recording:
+            self._is_model_kinematics_unrecorded = False
 
     def _resolve_broadphase_traversal(self):
         if self._options.broadphase_traversal is not None:
@@ -1391,7 +1403,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                     [(1.0, 1.0, 1.0) if geom.type == gs.GEOM_TYPE.MESH else geom.data[:3] for geom in geoms_design],
                     dtype=gs.np_float,
                 )
-                design_shape = (len(geoms_design), self._B, 3)
+                design_shape = (len(geoms_design), self.n_envs_, 3)
                 self.dyn_info.geoms_design.pos.from_numpy(np.broadcast_to(geoms_pos[:, None], design_shape))
                 self.dyn_info.geoms_design.size.from_numpy(np.broadcast_to(geoms_size[:, None], design_shape))
                 self._geoms_affine_idx = np.array([geom.idx for geom in geoms_design], dtype=gs.np_int)
@@ -1416,7 +1428,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             vgeoms_pos = np.array(
                 [vgeom.init_pos for vgeom in self.vgeoms if self._vgeoms_design_idx[vgeom.idx] >= 0], dtype=gs.np_float
             )
-            design_shape = (len(vgeoms_pos), self._B, 3)
+            design_shape = (len(vgeoms_pos), self.n_envs_, 3)
             self.dyn_info.vgeoms_design.pos.from_numpy(np.broadcast_to(vgeoms_pos[:, None], design_shape))
             self.dyn_info.vgeoms_design.scale.from_numpy(np.ones(design_shape, dtype=gs.np_float))
 
@@ -2280,10 +2292,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 shape = (indices.numel(), *shape)
                 values = values.to(device=gs.device, dtype=gs.tc_float)
                 if values.shape == shape:
-                    values = values.expand(self._B, *shape)
+                    values = values.expand(self.n_envs_, *shape)
                 elif self.n_envs == 0 or values.shape != (self.n_envs, *shape):
                     gs.raise_exception(
-                        f"`{name}` expects shape {shape} or a leading dimension of {self._B} environments."
+                        f"`{name}` expects shape {shape} or a leading dimension of {self.n_envs_} environments."
                     )
                 values_numeric = values.detach()
                 is_finite = values_numeric.isfinite().all(dim=tuple(range(1, values.ndim)))
@@ -2346,7 +2358,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 )
             else:
                 geometry.extend(
-                    torch.empty((self._B, 0, 3), dtype=gs.tc_float, device=gs.device)[env] for _ in range(2)
+                    torch.empty((self.n_envs_, 0, 3), dtype=gs.tc_float, device=gs.device)[env] for _ in range(2)
                 )
         collision_offset, collision_size, visual_offset, visual_scale = geometry
         sizes_by_type = []
@@ -2393,15 +2405,16 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if links_idx is not None and self.n_dofs:
             kernel_refresh_model_invweight(
                 links_idx,
-                self.scene._envs_idx,
+                self._envs_idx,
                 self.dyn_state,
                 self.constraint_solver.constraint_state,
                 self.dyn_info,
                 self.rigid_info,
                 self.rigid_config,
             )
-        self.refresh_forward_kinematics(self.scene._envs_idx)
+        self.refresh_forward_kinematics(self._envs_idx)
         self.changelog.add(StateChange.GEOMETRY)
+        self._is_model_kinematics_unrecorded = True
         self.collider.clear()
         self.constraint_solver.clear()
         self.constraint_solver.reset()
@@ -2430,7 +2443,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         qd_zero_grad(self.rigid_info.mass_mat)
         if gs.use_zerocopy.is_supported and gs.backend == gs.metal:
             torch.mps.synchronize()
-        envs_idx = self.scene._envs_idx
+        envs_idx = self._envs_idx
         dyn_state, dyn_info, rigid_info, rigid_config = (
             self.dyn_state,
             self.dyn_info,
@@ -3175,7 +3188,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         return tensor[0] if self.n_envs == 0 else tensor
 
     def get_geoms_pos(self, geoms_idx=None, envs_idx=None, *, relative=False, copy: bool | None = True):
-        tensor = qd_to_torch(self.dyn_state.geoms.pos, envs_idx, geoms_idx, transpose=True, copy=copy)
+        tensor = self._read_data(self.dyn_state.geoms.pos, envs_idx, geoms_idx, copy=copy)
         if relative and self._geoms_offset_pos is not None:
             quat = qd_to_torch(self.dyn_state.geoms.quat, envs_idx, geoms_idx, transpose=True)
             offset_pos = self._geoms_offset_pos if geoms_idx is None else self._geoms_offset_pos[geoms_idx]
@@ -3728,6 +3741,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
     # ------------------------------------------------------------------------------------
 
     @property
+    def has_editable_parameters(self):
+        return self._has_editable_parameters
+
+    @property
     def n_geoms(self) -> int:
         return len(self._geoms)
 
@@ -4208,6 +4225,30 @@ class RigidScopedRenderContext(KinematicScopedRenderContext, ScopedRenderContext
                 render_pos[:, self._vgeoms_edit_slot] = vgeoms_pos
                 qd_from_torch(self._data.vgeoms.pos, render_pos.transpose(0, 1).contiguous())
         return shapes
+
+    def get_vverts(self, vgeoms, envs_idx=None):
+        vverts = super().get_vverts(vgeoms, envs_idx)
+        solver = self.owner
+        if solver._vgeoms_design_idx is None:
+            return vverts
+        # The vertices of an editable visual geom are scaled about its origin in its own frame, as drawn
+        vgeoms_idx = np.array([vgeom.idx for vgeom in vgeoms], dtype=gs.np_int)
+        vgeoms_design_idx = solver._vgeoms_design_idx[vgeoms_idx]
+        vgeoms_is_edited = vgeoms_design_idx >= 0
+        if not vgeoms_is_edited.any():
+            return vverts
+        vgeoms_n_vverts = np.array([vgeom.n_vverts for vgeom in vgeoms], dtype=gs.np_int)
+        n_vverts = torch.as_tensor(vgeoms_n_vverts[vgeoms_is_edited], device=gs.device)
+        vgeoms_edited_idx = vgeoms_idx[vgeoms_is_edited]
+        pos = self.get_vgeoms_pose(vgeoms_edited_idx, envs_idx, is_quat=False).repeat_interleave(n_vverts, dim=-2)
+        quat = self.get_vgeoms_pose(vgeoms_edited_idx, envs_idx, is_quat=True).repeat_interleave(n_vverts, dim=-2)
+        design_idx = vgeoms_design_idx[vgeoms_is_edited]
+        scale = qd_to_torch(solver.dyn_info.vgeoms_design.scale, envs_idx, design_idx, transpose=True)
+        scale = scale.repeat_interleave(n_vverts, dim=-2)
+        is_vvert_edited = torch.as_tensor(np.repeat(vgeoms_is_edited, vgeoms_n_vverts), device=gs.device)
+        local_vverts = gu.inv_transform_by_quat(vverts[:, is_vvert_edited] - pos, quat)
+        vverts[:, is_vvert_edited] = pos + gu.transform_by_quat(scale * local_vverts, quat)
+        return vverts
 
     @property
     def islands(self) -> bool:
