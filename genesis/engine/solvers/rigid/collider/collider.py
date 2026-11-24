@@ -235,9 +235,34 @@ class Collider:
         self._links_n_geoms = np.bincount(self._geoms_link_idx, minlength=self._solver.n_links_)
 
         has_prunable_contacts = gs.use_ndarray or has_nonconvex_nonterrain or has_terrain
-        if not has_prunable_contacts and len(self._valid_collision_pairs):
+        if self._solver.has_editable_parameters or (not has_prunable_contacts and len(self._valid_collision_pairs)):
             geoms_type = np.array([geom.type for geom in self._solver.geoms])
             pairs_type = geoms_type[self._valid_collision_pairs]
+        self._has_contact_adjoint_plane_pair = True
+        self._has_contact_adjoint_analytic_pair = True
+        self._has_contact_adjoint_generic_pair = True
+        self._has_contact_adjoint_capsule_pair = has_non_box_plane_convex_convex or gs.use_ndarray
+        self._has_contact_adjoint_plane_cylinder_pair = False
+        if self._solver.has_editable_parameters:
+            is_plane_pair = (pairs_type == gs.GEOM_TYPE.PLANE).any(axis=1)
+            # See func_analytic_contact. Only capsules can produce secondary contacts in the analytic route.
+            is_capsule_pair = (pairs_type == gs.GEOM_TYPE.CAPSULE).all(axis=1)
+            is_analytic_pair = is_capsule_pair | (
+                (pairs_type == gs.GEOM_TYPE.SPHERE).any(axis=1)
+                & np.isin(pairs_type, (gs.GEOM_TYPE.SPHERE, gs.GEOM_TYPE.CAPSULE, gs.GEOM_TYPE.BOX)).all(axis=1)
+            )
+            self._has_contact_adjoint_plane_pair = bool(is_plane_pair.any())
+            self._has_contact_adjoint_plane_cylinder_pair = bool(
+                (is_plane_pair & (pairs_type == gs.GEOM_TYPE.CYLINDER).any(axis=1)).any()
+            )
+            self._has_contact_adjoint_analytic_pair = bool(is_analytic_pair.any())
+            self._has_contact_adjoint_generic_pair = bool((~(is_plane_pair | is_analytic_pair)).any())
+            self._has_contact_adjoint_capsule_pair = (
+                not self._solver._enable_mujoco_compatibility
+                and self._solver._enable_multi_contact
+                and bool(is_capsule_pair.any())
+            )
+        if not has_prunable_contacts and len(self._valid_collision_pairs):
             pairs_link_idx = np.sort(self._geoms_link_idx[self._valid_collision_pairs], axis=1)
             is_point_pair = np.isin(pairs_type, (gs.GEOM_TYPE.SPHERE, gs.GEOM_TYPE.ELLIPSOID)).any(axis=1)
             is_multi_point_pair = ~is_point_pair & (
@@ -422,7 +447,7 @@ class Collider:
         Compute flat indices of all valid collision pairs, plus algorithm flags.
 
         For each pair of geoms, determine if they can collide based on their properties and the solver configuration.
-        Pairs that are already colliding at the initial configuration (qpos0) are filtered out with a warning.
+        Pairs with fixed geometry that already collide at the initial configuration (qpos0) are filtered out.
 
         Returns (n_possible_pairs, collision_pair_idx, pair_flags) where pair_flags is a dict of booleans
         for has_terrain, has_non_box_plane_convex_convex, has_convex_specialization, has_nonconvex_nonterrain.
@@ -564,8 +589,16 @@ class Collider:
         # These checks only apply when self_collision is enabled and the pair passed all vectorized filters
         self_colliding_pairs: list[tuple[int, int]] = []
 
-        needs_self_check = self._solver._enable_self_collision and np.any(valid & same_root)
-        needs_neutral_check = needs_self_check and not self._solver._enable_neutral_collision
+        is_editable_pair = None
+        if self._solver._geoms_design_idx is not None:
+            is_editable_geom = self._solver._geoms_design_idx >= 0
+            is_editable_pair = is_editable_geom[row] | is_editable_geom[col]
+        self_root_indices = np.flatnonzero(valid & same_root) if self._solver._enable_self_collision else ()
+        neutral_check = valid & same_root
+        if is_editable_pair is not None:
+            # An imported overlap does not determine whether an editable pair can contact in a later design.
+            neutral_check &= ~is_editable_pair
+        needs_neutral_check = len(self_root_indices) > 0 and not self._solver._enable_neutral_collision
 
         # Lazily compute geom vertices only for geoms that need neutral overlap checks
         geoms_verts: dict[int, np.ndarray] = {}
@@ -573,9 +606,8 @@ class Collider:
         # and shared by every other pair it enters, since voxelization dominates this check and a link usually overlaps
         # several others in the neutral configuration
         geoms_voxels: dict[int, tuple[trimesh.voxel.VoxelGrid, np.ndarray]] = {}
-        if needs_neutral_check:
-            self_root_indices = np.where(valid & same_root)[0]
-            self_root_geom_idxs = np.unique(np.concatenate([row[self_root_indices], col[self_root_indices]]))
+        if needs_neutral_check and np.any(neutral_check):
+            self_root_geom_idxs = np.unique(np.concatenate([row[neutral_check], col[neutral_check]]))
             # Compute vertices only for geoms involved in self-collision pairs, shrunk by 0.1% to avoid false positive
             # when detecting self-collision. The pose of a heterogeneous geom is only meaningful in the environments
             # carrying its variant. The pair filter above leaves only variants that some environment carries, and every
@@ -592,8 +624,7 @@ class Collider:
                 verts = centroid + (1.0 - 1e-3) * (verts - centroid)
                 geoms_verts[i_g] = verts
 
-        if needs_self_check:
-            self_root_indices = np.where(valid & same_root)[0]
+        if len(self_root_indices) > 0:
             for idx in self_root_indices:
                 i_ga, i_gb = row[idx], col[idx]
                 link_ga = geoms[i_ga].link
@@ -616,7 +647,7 @@ class Collider:
                         continue
 
                 # active in neutral configuration (qpos0)
-                if needs_neutral_check:
+                if needs_neutral_check and neutral_check[idx]:
                     verts_a = geoms_verts[i_ga]
                     mesh_a = trimesh.Trimesh(vertices=verts_a, faces=geoms[i_ga].init_faces, process=False)
                     verts_b = geoms_verts[i_gb]
@@ -661,10 +692,17 @@ class Collider:
         valid_convex_a = geom_is_convex[row[valid_indices]]
         valid_convex_b = geom_is_convex[col[valid_indices]]
 
-        has_any_vs_terrain = bool(
-            np.any((valid_type_a == gs.GEOM_TYPE.TERRAIN) | (valid_type_b == gs.GEOM_TYPE.TERRAIN))
-        )
+        is_terrain_pair = (valid_type_a == gs.GEOM_TYPE.TERRAIN) | (valid_type_b == gs.GEOM_TYPE.TERRAIN)
+        has_any_vs_terrain = bool(np.any(is_terrain_pair))
         both_convex = valid_convex_a & valid_convex_b
+        if is_editable_pair is not None:
+            unsupported_pair = is_editable_pair[valid_indices] & (is_terrain_pair | ~both_convex)
+            if np.any(unsupported_pair):
+                i_ga, i_gb = valid_collision_pairs[np.flatnonzero(unsupported_pair)[0]]
+                gs.raise_exception(
+                    f"Editable collision pair ({i_ga}, {i_gb}) requires a plane or two convex geoms. "
+                    "Use convex collision geoms and replace terrain with a plane, or filter out the pair."
+                )
         if np.any(both_convex):
             is_box_a = valid_type_a == gs.GEOM_TYPE.BOX
             is_box_b = valid_type_b == gs.GEOM_TYPE.BOX
@@ -1149,9 +1187,15 @@ class Collider:
             self.collider_info,
             self.mpr.mpr_info,
             self.gjk.gjk_info,
+            self.support_field.support_field_info,
             self._solver.rigid_config,
             self.collider_config,
-            self._solver._errno,
+            plane_pair=self._has_contact_adjoint_plane_pair,
+            analytic_pair=self._has_contact_adjoint_analytic_pair,
+            generic_pair=self._has_contact_adjoint_generic_pair,
+            capsule_pair=self._has_contact_adjoint_capsule_pair,
+            plane_cylinder_pair=self._has_contact_adjoint_plane_cylinder_pair,
+            errno=self._solver._errno,
         )
 
 

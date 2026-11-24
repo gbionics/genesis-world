@@ -3,9 +3,87 @@ import pytest
 import torch
 
 import genesis as gs
+from genesis.engine.entities import PhysicalParameter
+from genesis.utils.geom import quat_to_R
 
 from ..utils.assertions import assert_allclose
 from .utils import assert_grad_matches_fd, make_diff_scene_pair
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_urdf_physical_parameter_gradients(grad_urdf, n_envs, precision, show_viewer):
+    dt = 0.01
+    torque = 0.2
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=dt,
+            requires_grad=True,
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.5, -1.5, 1.0),
+            camera_lookat=(0.2, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    robot = scene.add_entity(
+        morph=gs.morphs.URDF(
+            file=grad_urdf,
+            fixed=True,
+            differentiable_parameters=True,
+        ),
+    )
+    robot_reference = scene.add_entity(
+        morph=gs.morphs.URDF(
+            file=grad_urdf,
+            pos=(0.0, 0.6, 0.0),
+            fixed=True,
+        ),
+    )
+    scene.build(n_envs=n_envs)
+    rotor = robot.get_link("rotor")
+    links_idx = [rotor.idx_local]
+    parameters = robot.get_physical_parameters()
+    armature = robot.get_dofs_armature()
+    for is_shared in (True, False) if n_envs else (True,):
+        scene.reset()
+        env = 0 if n_envs and is_shared else slice(None)
+        mass = parameters.mass[env][..., links_idx].requires_grad_()
+        com = parameters.center_of_mass[env][..., links_idx, :].requires_grad_()
+        inertia_diag = parameters.inertia[env][..., links_idx, :, :].diagonal(dim1=-2, dim2=-1).requires_grad_()
+        length = parameters.link_offset[env][..., links_idx, 0].clone().requires_grad_()
+        offset = torch.cat((length[..., None], parameters.link_offset[env][..., links_idx, 1:]), dim=-1)
+        robot.bind_physical_parameters(
+            mass=PhysicalParameter(links_idx, mass),
+            center_of_mass=PhysicalParameter(links_idx, com),
+            inertia=PhysicalParameter(links_idx, torch.diag_embed(inertia_diag)),
+            link_offset=PhysicalParameter(links_idx, offset),
+        )
+        pos = rotor.get_pos()
+        robot.control_dofs_force(torque)
+        robot_reference.control_dofs_force(torque)
+        for _ in range(2):
+            scene.step()
+        vel = robot.get_dofs_velocity()
+        axis = quat_to_R(parameters.inertial_quat[env][..., links_idx, :])[..., 2, :]
+        axial_inertia = (inertia_diag * axis.square()).sum(dim=-1)
+        effective_inertia = axial_inertia + mass * com[..., :2].square().sum(dim=-1) + armature
+        expected_vel = 2 * dt * torque / effective_inertia
+        expected_pos_x = length.squeeze(-1).expand(max(1, n_envs)) if n_envs else length.squeeze(-1)
+        tol = 1e-10 if precision == "64" else 5e-5
+        assert_allclose(pos[..., 0], expected_pos_x, tol=tol)
+        assert_allclose(vel, expected_vel, tol=tol)
+        with torch.no_grad():
+            assert_allclose(vel, robot_reference.get_dofs_velocity(), tol=tol)
+        inputs = (mass, com, inertia_diag, length)
+        expected_grads = torch.autograd.grad(expected_pos_x.sum() + expected_vel.sum(), inputs)
+        (pos[..., 0].sum() + vel.sum()).backward()
+        for parameter, expected_grad in zip(inputs, expected_grads):
+            assert_allclose(parameter.grad, expected_grad, tol=tol)
 
 
 @pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])

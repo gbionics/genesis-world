@@ -1338,6 +1338,19 @@ def func_init_meaninertia(envs_idx: qd.types.ndarray(), rigid_info: RigidInfo, r
 
 
 @qd.func
+def func_inverse_weight_mass_adjoint(
+    i_b: int, dof_start: int, dof_end: int, g_weight: float, solve_out: qd.Tensor, rigid_info: RigidInfo
+):
+    # For a = M^-1 j, the mass term of d(j^T a) is -a^T (dM) a.
+    for i_d in range(dof_start, dof_end):
+        scale = -g_weight * solve_out[i_d, i_b]
+        for j_d in range(dof_start, dof_end):
+            rigid_info.mass_mat.grad[i_d, j_d, i_b] = (
+                rigid_info.mass_mat.grad[i_d, j_d, i_b] + scale * solve_out[j_d, i_b]
+            )
+
+
+@qd.func
 def func_init_link_invweight(
     i_l: int,
     i_b: int,
@@ -1348,6 +1361,7 @@ def func_init_link_invweight(
     rigid_info: RigidInfo,
     rigid_config: qd.template(),
     force_update: qd.template(),
+    reverse: qd.template() = False,
 ):
     """Compute the two constraint inverse weights of one link, from the mass matrix at the neutral configuration.
 
@@ -1381,7 +1395,15 @@ def func_init_link_invweight(
         dof_end = rigid_info.dofs_mass_block_end[dof_max]
 
     for i_c in qd.static(range(2)):
-        if force_update or dyn_info.links.invweight[I_l][i_c] < EPS:
+        g_weight = gs.qd_float(0.0)
+        if qd.static(reverse):
+            g_weight = dyn_info.links.invweight.grad[I_l][i_c] / 3.0
+        is_update_required = (
+            (qd.abs(g_weight) > 0.0)
+            if qd.static(reverse)
+            else (force_update or dyn_info.links.invweight[I_l][i_c] < EPS)
+        )
+        if is_update_required:
             offset = dyn_state.links.i_pos[i_l, i_b]
             weight = 0.0
             for i_r in qd.static(range(3)):
@@ -1400,13 +1422,30 @@ def func_init_link_invweight(
                             jac_row[i_d, i_b] = dyn_state.dofs.cdof_ang[i_d, i_b][i_r]
                     j_l = dyn_info.links.parent_idx[J_l]
                 func_solve_mass_block(i_b, dof_start, dof_end, jac_row, solve_out, rigid_info, rigid_config)
-                for i_d in range(dof_start, dof_end):
-                    weight = weight + jac_row[i_d, i_b] * solve_out[i_d, i_b]
+                if qd.static(reverse):
+                    func_inverse_weight_mass_adjoint(i_b, dof_start, dof_end, g_weight, solve_out, rigid_info)
+                    j_l = i_l
+                    while j_l != -1:
+                        J_l = [j_l, i_b] if qd.static(rigid_config.batch_links_info) else j_l
+                        for i_d in range(dyn_info.links.dof_start[J_l], dyn_info.links.dof_end[J_l]):
+                            g_j = qd.Vector.zero(gs.qd_float, 3)
+                            g_j[i_r] = 2.0 * g_weight * solve_out[i_d, i_b]
+                            g_ang = g_j
+                            if qd.static(i_c == 0):
+                                g_ang = offset.cross(g_j)
+                                dyn_state.dofs.cdof_vel.grad[i_d, i_b] = dyn_state.dofs.cdof_vel.grad[i_d, i_b] + g_j
+                                dyn_state.links.i_pos.grad[i_l, i_b] = dyn_state.links.i_pos.grad[i_l, i_b] + g_j.cross(
+                                    dyn_state.dofs.cdof_ang[i_d, i_b]
+                                )
+                            dyn_state.dofs.cdof_ang.grad[i_d, i_b] = dyn_state.dofs.cdof_ang.grad[i_d, i_b] + g_ang
+                        j_l = dyn_info.links.parent_idx[J_l]
+                else:
+                    for i_d in range(dof_start, dof_end):
+                        weight = weight + jac_row[i_d, i_b] * solve_out[i_d, i_b]
 
-            # A zero component is kept as is: substituting the other component to avoid degenerate constraint
-            # weights over-stiffens the impedance of constraints on such links (e.g. connect constraints on a link
-            # whose frame origin cannot translate) and destabilizes them.
-            dyn_info.links.invweight[I_l][i_c] = weight / 3.0
+            if qd.static(not reverse):
+                # Substituting the other component for a zero weight over-stiffens the constrained motion.
+                dyn_info.links.invweight[I_l][i_c] = weight / 3.0
 
 
 @qd.func
@@ -1419,6 +1458,7 @@ def func_init_dofs_invweight(
     rigid_info: RigidInfo,
     rigid_config: qd.template(),
     force_update: qd.template(),
+    reverse: qd.template() = False,
 ):
     """Compute the constraint inverse weight of every DOF of the joints of one link, at the neutral configuration.
 
@@ -1445,11 +1485,18 @@ def func_init_dofs_invweight(
             for i_group in range(n_groups):
                 group_dof_start = joint_dof_start + i_group * group_n_dofs
                 is_update_required = False
+                g_weight = gs.qd_float(0.0)
                 for i_d_ in range(group_n_dofs):
                     i_d = group_dof_start + i_d_
                     I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
-                    if force_update or dyn_info.dofs.invweight[I_d] < EPS:
-                        is_update_required = True
+                    if qd.static(reverse):
+                        g_weight = g_weight + dyn_info.dofs.invweight.grad[I_d]
+                    else:
+                        if force_update or dyn_info.dofs.invweight[I_d] < EPS:
+                            is_update_required = True
+                if qd.static(reverse):
+                    g_weight = g_weight / group_n_dofs
+                    is_update_required = qd.abs(g_weight) > 0.0
 
                 if is_update_required:
                     weight = 0.0
@@ -1461,14 +1508,74 @@ def func_init_dofs_invweight(
                             jac_row[j_d, i_b] = 0.0
                         jac_row[i_d, i_b] = 1.0
                         func_solve_mass_block(i_b, block_start, block_end, jac_row, solve_out, rigid_info, rigid_config)
-                        weight = weight + solve_out[i_d, i_b]
-                    weight = weight / group_n_dofs
+                        if qd.static(reverse):
+                            func_inverse_weight_mass_adjoint(
+                                i_b, block_start, block_end, g_weight, solve_out, rigid_info
+                            )
+                        else:
+                            weight = weight + solve_out[i_d, i_b]
 
-                    for i_d_ in range(group_n_dofs):
-                        i_d = group_dof_start + i_d_
-                        I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
-                        if force_update or dyn_info.dofs.invweight[I_d] < EPS:
-                            dyn_info.dofs.invweight[I_d] = weight
+                    if qd.static(not reverse):
+                        weight = weight / group_n_dofs
+                        for i_d_ in range(group_n_dofs):
+                            i_d = group_dof_start + i_d_
+                            I_d = [i_d, i_b] if qd.static(rigid_config.batch_dofs_info) else i_d
+                            if force_update or dyn_info.dofs.invweight[I_d] < EPS:
+                                dyn_info.dofs.invweight[I_d] = weight
+
+
+@qd.kernel(fastcache=True)
+def kernel_neutral_mass_matrix(
+    envs_idx: qd.types.ndarray(),
+    dyn_state: DynState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
+    rigid_config: qd.template(),
+):
+    func_compute_mass_matrix_masked(
+        envs_idx, dyn_state, dyn_info, rigid_info, rigid_config, implicit_damping=False, is_backward=True
+    )
+
+
+@qd.kernel(fastcache=True)
+def kernel_seed_inverse_weight_adjoint(
+    envs_idx: qd.types.ndarray(),
+    dyn_state: DynState,
+    constraint_state: ConstraintState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
+    rigid_config: qd.template(),
+):
+    func_factor_mass_masked(envs_idx, dyn_state, dyn_info, rigid_info, rigid_config, implicit_damping=False)
+    qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_r, i_b_ in qd.ndrange(rigid_info.roots_link_idx.shape[0], envs_idx.shape[0]):
+        i_b = envs_idx[i_b_]
+        i_l_root = rigid_info.roots_link_idx[i_r]
+        for i_l in range(i_l_root, rigid_info.links_root_end[i_l_root]):
+            if dyn_info.links.root_idx[i_l, i_b] == i_l_root:
+                func_init_link_invweight(
+                    i_l,
+                    i_b,
+                    constraint_state.grad,
+                    constraint_state.Mgrad,
+                    dyn_state,
+                    dyn_info,
+                    rigid_info,
+                    rigid_config,
+                    force_update=True,
+                    reverse=True,
+                )
+                func_init_dofs_invweight(
+                    i_l,
+                    i_b,
+                    constraint_state.grad,
+                    constraint_state.Mgrad,
+                    dyn_info,
+                    rigid_info,
+                    rigid_config,
+                    force_update=True,
+                    reverse=True,
+                )
 
 
 @qd.func
@@ -1582,6 +1689,29 @@ def kernel_factor_mass_mat(
 ):
     """Factor the mass matrix of some environments, of every kinematic tree (see kernel_update_mass_mat)."""
     func_factor_mass_masked(envs_idx, dyn_state, dyn_info, rigid_info, rigid_config, implicit_damping=False)
+
+
+@qd.kernel(fastcache=True)
+def kernel_refresh_model_invweight(
+    links_idx: qd.types.ndarray(),
+    envs_idx: qd.types.ndarray(),
+    dyn_state: DynState,
+    constraint_state: ConstraintState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
+    rigid_config: qd.template(),
+):
+    func_refresh_links_invweight_and_meaninertia(
+        links_idx,
+        envs_idx,
+        constraint_state.grad,
+        constraint_state.Mgrad,
+        dyn_state,
+        dyn_info,
+        rigid_info,
+        rigid_config,
+        refresh_velocity=False,
+    )
 
 
 @qd.kernel(fastcache=True)

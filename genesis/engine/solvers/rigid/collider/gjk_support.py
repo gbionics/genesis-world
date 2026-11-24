@@ -9,6 +9,8 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.data import DynInfo
+from genesis.engine.solvers.rigid.geometry import func_mesh_scale
+
 from . import support_field
 from .data import ColliderState, GJKInfo, GJKState
 from .support_field import SupportFieldInfo
@@ -30,6 +32,9 @@ def support_mesh(
     Find the support point on a mesh in the given direction.
     """
     d_mesh = gu.qd_transform_by_quat(direction, gu.qd_inv_quat(quat))
+    scale = func_mesh_scale(i_g, i_b, dyn_info)
+    if qd.static(len(dyn_info.geoms.design_idx.shape) == 1):
+        d_mesh = d_mesh * scale
 
     # Exhaustively search for the vertex with maximum dot product
     fmax = -gjk_info.FLOAT_MAX[None]
@@ -53,6 +58,8 @@ def support_mesh(
             imax = i
 
     v = dyn_info.verts.init_pos[imax]
+    if qd.static(len(dyn_info.geoms.design_idx.shape) == 1):
+        v = v * scale
     vid = imax
 
     gjk_state.support_mesh_prev_vertex_id[i_o, i_b] = vid
@@ -87,15 +94,21 @@ def support_driver(
 
     geom_type = dyn_info.geoms.type[i_g]
     if geom_type == gs.GEOM_TYPE.SPHERE:
-        v, v_, vid = support_field._func_support_sphere(i_g, direction, pos, quat, dyn_info, shrink_sphere)
+        v, v_, vid = support_field._func_support_sphere(i_g, i_b, direction, pos, quat, dyn_info, shrink_sphere)
     elif geom_type == gs.GEOM_TYPE.ELLIPSOID:
-        v = support_field._func_support_ellipsoid(i_g, direction, pos, quat, dyn_info)
+        v, local_pos = support_field._func_support_ellipsoid(i_g, direction, pos, quat, dyn_info)
+        if qd.static(rigid_config.requires_grad):
+            v_ = local_pos
     elif geom_type == gs.GEOM_TYPE.CAPSULE:
-        v = support_field._func_support_capsule(i_g, direction, pos, quat, dyn_info, shrink_sphere)
+        v, local_pos = support_field._func_support_capsule(i_g, i_b, direction, pos, quat, dyn_info, shrink_sphere)
+        if qd.static(rigid_config.requires_grad):
+            v_ = local_pos
     elif geom_type == gs.GEOM_TYPE.CYLINDER:
-        v = support_field._func_support_cylinder(i_g, direction, pos, quat, dyn_info, shrink_sphere)
+        v, local_pos = support_field._func_support_cylinder(i_g, i_b, direction, pos, quat, dyn_info, shrink_sphere)
+        if qd.static(rigid_config.requires_grad):
+            v_ = local_pos
     elif geom_type == gs.GEOM_TYPE.BOX:
-        v, v_, vid = support_field._func_support_box(i_g, direction, pos, quat, dyn_info)
+        v, v_, vid = support_field._func_support_box(i_g, i_b, direction, pos, quat, dyn_info)
     elif geom_type == gs.GEOM_TYPE.TERRAIN:
         if qd.static(collider_config.has_terrain):
             v, vid = support_field._func_support_prism(i_b, direction, collider_state)
@@ -105,11 +118,11 @@ def support_driver(
             v, v_, vid = support_mesh(i_g, i_b, i_o, direction, pos, quat, gjk_state, dyn_info, gjk_info)
         else:
             v, v_, vid = support_field._func_support_world(
-                i_g, direction, pos, quat, dyn_info, support_field_info, exhaustive=True
+                i_g, i_b, direction, pos, quat, dyn_info, support_field_info, exhaustive=True
             )
     else:
         v, v_, vid = support_field._func_support_world(
-            i_g, direction, pos, quat, dyn_info, support_field_info, exhaustive=False
+            i_g, i_b, direction, pos, quat, dyn_info, support_field_info, exhaustive=False
         )
     return v, v_, vid
 

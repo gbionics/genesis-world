@@ -11,6 +11,8 @@ from ..conftest import lazy_imports
 with lazy_imports():
     import torch
 
+    import trimesh
+
     import quadrants as qd
 
     import genesis as gs
@@ -132,6 +134,87 @@ def _add_hinge_arm(parent, body_name, pos, axis="0 1 0", joint_pos=None, **joint
     ET.SubElement(body, "inertial", mass="0.5", pos="0.1 0 0", diaginertia="0.01 0.01 0.01")
     ET.SubElement(body, "geom", type="capsule", fromto="0 0 0 0.2 0 0", size="0.02", contype="0", conaffinity="0")
     return body
+
+
+@pytest.fixture(scope="session")
+def grad_urdf():
+    robot = ET.Element("robot", name="rotor")
+    ET.SubElement(robot, "link", name="base")
+    link = ET.SubElement(robot, "link", name="rotor")
+    inertial = ET.SubElement(link, "inertial")
+    ET.SubElement(inertial, "origin", xyz="0.2 0 0")
+    ET.SubElement(inertial, "mass", value="1.5")
+    ET.SubElement(inertial, "inertia", ixx="0.04", ixy="0", ixz="0", iyy="0.05", iyz="0", izz="0.06")
+    for role in ("visual", "collision"):
+        geom = ET.SubElement(link, role)
+        ET.SubElement(geom, "origin", xyz="0.2 0 0")
+        geometry = ET.SubElement(geom, "geometry")
+        ET.SubElement(geometry, "box", size="0.4 0.1 0.1")
+    joint = ET.SubElement(robot, "joint", name="pivot", type="continuous")
+    ET.SubElement(joint, "origin", xyz="0.1 0 0.5")
+    ET.SubElement(joint, "parent", link="base")
+    ET.SubElement(joint, "child", link="rotor")
+    ET.SubElement(joint, "axis", xyz="0 0 1")
+    return ET.tostring(robot, encoding="unicode")
+
+
+@pytest.fixture(scope="session")
+def grad_urdf_mesh(grad_urdf, asset_tmp_path):
+    mesh_path = asset_tmp_path / "design_rotor.obj"
+    trimesh.creation.box(extents=(0.4, 0.1, 0.1)).export(mesh_path)
+    robot = ET.fromstring(grad_urdf)
+    geometry = robot.find("link[@name='rotor']/collision/geometry")
+    geometry.clear()
+    ET.SubElement(geometry, "mesh", filename=str(mesh_path))
+    return ET.tostring(robot, encoding="unicode")
+
+
+@pytest.fixture(scope="session")
+def grad_urdf_capsule(grad_urdf):
+    robot = ET.fromstring(grad_urdf)
+    collision = robot.find("link[@name='rotor']/collision")
+    collision.find("origin").set("rpy", "0 1.5707963267948966 0")
+    geometry = collision.find("geometry")
+    geometry.clear()
+    ET.SubElement(geometry, "capsule", radius="0.06", length="0.28")
+    return ET.tostring(robot, encoding="unicode")
+
+
+@pytest.fixture(scope="session")
+def grad_urdf_cylinder(grad_urdf_capsule):
+    robot = ET.fromstring(grad_urdf_capsule)
+    robot.find("link[@name='rotor']/collision/geometry/capsule").tag = "cylinder"
+    return ET.tostring(robot, encoding="unicode")
+
+
+@pytest.fixture(scope="session")
+def grad_urdf_sphere(grad_urdf):
+    robot = ET.fromstring(grad_urdf)
+    geometry = robot.find("link[@name='rotor']/collision/geometry")
+    geometry.clear()
+    ET.SubElement(geometry, "sphere", radius="0.06")
+    return ET.tostring(robot, encoding="unicode")
+
+
+@pytest.fixture(scope="session")
+def grad_urdf_joint_constraints(grad_urdf):
+    robot = ET.fromstring(grad_urdf)
+    driver = robot.find("joint[@name='pivot']")
+    driver.set("type", "revolute")
+    ET.SubElement(driver, "limit", lower="-0.1", upper="0.1", effort="100", velocity="100")
+    ET.SubElement(driver, "dynamics", friction="50")
+    link = ET.SubElement(robot, "link", name="follower")
+    inertial = ET.SubElement(link, "inertial")
+    ET.SubElement(inertial, "origin", xyz="0.1 0 0")
+    ET.SubElement(inertial, "mass", value="1.0")
+    ET.SubElement(inertial, "inertia", ixx="0.01", ixy="0", ixz="0", iyy="0.02", iyz="0", izz="0.02")
+    joint = ET.SubElement(robot, "joint", name="follower_pivot", type="continuous")
+    ET.SubElement(joint, "origin", xyz="0.4 0 0")
+    ET.SubElement(joint, "parent", link="rotor")
+    ET.SubElement(joint, "child", link="follower")
+    ET.SubElement(joint, "axis", xyz="0 0 1")
+    ET.SubElement(joint, "mimic", joint="pivot", multiplier="0.5")
+    return ET.tostring(robot, encoding="unicode")
 
 
 @pytest.fixture(scope="session")

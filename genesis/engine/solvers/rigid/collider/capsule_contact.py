@@ -3,6 +3,8 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.data import DynInfo, RigidInfo
+from genesis.engine.solvers.rigid.geometry import func_geom_size
+
 from . import utils
 
 
@@ -10,6 +12,7 @@ from . import utils
 def func_capsule_capsule_contact(
     i_ga: int,
     i_gb: int,
+    i_b: int,
     ga_pos: qd.types.vector(3),
     ga_quat: qd.types.vector(4),
     gb_pos: qd.types.vector(3),
@@ -34,14 +37,16 @@ def func_capsule_capsule_contact(
     # Get capsule A parameters
     pos_a = ga_pos
     quat_a = ga_quat
-    radius_a = dyn_info.geoms.data[i_ga][0]
-    halflength_a = 0.5 * dyn_info.geoms.data[i_ga][1]
+    size_a = func_geom_size(i_ga, i_b, dyn_info)
+    radius_a = size_a[0]
+    halflength_a = 0.5 * size_a[1]
 
     # Get capsule B parameters
     pos_b = gb_pos
     quat_b = gb_quat
-    radius_b = dyn_info.geoms.data[i_gb][0]
-    halflength_b = 0.5 * dyn_info.geoms.data[i_gb][1]
+    size_b = func_geom_size(i_gb, i_b, dyn_info)
+    radius_b = size_b[0]
+    halflength_b = 0.5 * size_b[1]
 
     # Capsules are aligned along local Z-axis by convention
     local_z_unit = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
@@ -104,6 +109,7 @@ def func_capsule_capsule_contact(
 def func_sphere_sphere_contact(
     i_ga: int,
     i_gb: int,
+    i_b: int,
     ga_pos: qd.types.vector(3),
     gb_pos: qd.types.vector(3),
     dyn_info: DynInfo,
@@ -125,8 +131,8 @@ def func_sphere_sphere_contact(
     """
     EPS = rigid_info.EPS[None]
 
-    radius_a = dyn_info.geoms.data[i_ga][0]
-    radius_b = dyn_info.geoms.data[i_gb][0]
+    radius_a = func_geom_size(i_ga, i_b, dyn_info)[0]
+    radius_b = func_geom_size(i_gb, i_b, dyn_info)[0]
 
     # Vector from sphere B center to sphere A center (normal points into geom A, i.e. B to A).
     diff = ga_pos - gb_pos
@@ -160,6 +166,7 @@ def func_sphere_sphere_contact(
 def func_sphere_capsule_contact(
     i_ga: int,
     i_gb: int,
+    i_b: int,
     ga_pos: qd.types.vector(3),
     gb_pos: qd.types.vector(3),
     gb_quat: qd.types.vector(4),
@@ -184,9 +191,10 @@ def func_sphere_capsule_contact(
     sphere_center = ga_pos
     capsule_center = gb_pos
     capsule_quat = gb_quat
-    sphere_radius = dyn_info.geoms.data[i_ga][0]
-    capsule_radius = dyn_info.geoms.data[i_gb][0]
-    capsule_halflength = 0.5 * dyn_info.geoms.data[i_gb][1]
+    sphere_radius = func_geom_size(i_ga, i_b, dyn_info)[0]
+    capsule_size = func_geom_size(i_gb, i_b, dyn_info)
+    capsule_radius = capsule_size[0]
+    capsule_halflength = 0.5 * capsule_size[1]
 
     # Capsule is aligned along local Z-axis
     local_z_unit = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)

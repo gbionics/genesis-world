@@ -2,7 +2,7 @@ import functools
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from operator import attrgetter
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import numpy as np
 import torch
@@ -13,7 +13,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
 from genesis.constants import link_ref_frame
-from genesis.engine.entities import DroneEntity, RigidEntity, TerrainEntity
+from genesis.engine.entities import DroneEntity, PhysicalParameter, RigidEntity, RigidPhysicalParameters, TerrainEntity
 from genesis.engine.entities.rigid_entity import RigidGeom
 from genesis.engine.entities.rigid_entity.description import RigidEntityDescription, _balanced_variant_mapping
 from genesis.engine.entities.rigid_entity.rigid_equality import RigidEquality
@@ -40,12 +40,12 @@ from genesis.engine.solvers.rigid.constraint.solver import cholesky_tile_size_fo
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidConfig, RigidData, RigidErrorCode, RigidInfo
 from genesis.engine.state_change import StateChange, guard_reads, mutates, scoped_kind, untracked_launches
 from genesis.engine.states import SolverCheckpoint
-from genesis.grad.bridge import custom_backward, is_recording_launches
-from genesis.options.morphs import Drone, Morph, Terrain
+from genesis.grad.bridge import Operation, custom_backward, is_recording_launches
+from genesis.options.morphs import Drone, Morph, Terrain, URDF
 from genesis.options.solvers import RigidOptions
 from genesis.options.surfaces import Surface
 from genesis.typing import FArrayType, IndexType, Vec2FType, Vec3FType
-from genesis.utils.data import ConfigItem, DataItem, DataKind, is_opted_in
+from genesis.utils.data import ConfigItem, DataItem, DataKind, is_opted_in, opt_in
 from genesis.utils.misc import (
     DeprecationError,
     assign_indexed_tensor,
@@ -54,10 +54,13 @@ from genesis.utils.misc import (
     get_gpu_shared_tile_sizes,
     get_last_occurrence,
     indices_to_mask,
+    qd_from_torch,
     qd_to_numpy,
     qd_to_torch,
     qd_zero_grad,
+    sanitize_index,
     tensor_to_array,
+    tensor_to_cpu,
 )
 
 from ..base_solver import GravityMixin, TimeBasedMixin
@@ -118,7 +121,10 @@ from .abd.forward_dynamics import (
     kernel_factor_mass_mat,
     kernel_forward_dynamics_without_qacc,
     kernel_integrate,
+    kernel_neutral_mass_matrix,
     kernel_refresh_invweight_and_meaninertia,
+    kernel_refresh_model_invweight,
+    kernel_seed_inverse_weight_adjoint,
     kernel_update_acc,
     kernel_update_mass_mat,
     update_qacc_from_qvel_delta,
@@ -127,12 +133,14 @@ from .abd.forward_dynamics import (
 from .abd.forward_kinematics import (
     func_forward_velocity,
     func_update_cartesian_space,
+    kernel_COM_links_replay,
     kernel_forward_kinematics_links_geoms,
+    kernel_forward_kinematics_replay,
     kernel_masked_forward_kinematics_links_geoms,
     kernel_update_cartesian_space,
     kernel_update_verts_for_geoms,
 )
-from .abd.manual_bw import kernel_manual_compute_qacc_bw
+from .abd.manual_bw import kernel_manual_compute_qacc_bw, kernel_manual_forward_kinematics_bw
 from .abd.misc import (
     MASS_MAT_ASSEMBLY,
     FORWARD_STATUS,
@@ -151,6 +159,7 @@ from .abd.misc import (
     kernel_update_heterogeneous_link_info,
     kernel_wakeup_coupled_links,
 )
+
 from .collider.collider import Collider
 
 # Importing the decomposed solve registers it with func_solve_body (see solver_breakdown.py)
@@ -399,6 +408,26 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             if not self._enable_mujoco_compatibility:
                 self._options.tolerance *= 0.1
 
+        has_editable_parameters = any(
+            isinstance(entity.main_morph, URDF) and entity.main_morph.differentiable_parameters
+            for entity in self.entities
+        )
+        if has_editable_parameters:
+            if not self._requires_grad:
+                gs.raise_exception("Differentiable URDF parameters require `SimOptions(requires_grad=True)`.")
+            if self._enable_heterogeneous:
+                gs.raise_exception("Differentiable URDF parameters require homogeneous rigid entities.")
+            if any(
+                isinstance(entity.main_morph, URDF)
+                and entity.main_morph.differentiable_parameters
+                and entity.surface.vis_mode == "sdf"
+                for entity in self.entities
+            ):
+                gs.raise_exception("Use `vis_mode='collision'` to display editable collision geometry.")
+            self._options.batch_links_info = True
+            self._options.batch_dofs_info = True
+        self._has_editable_parameters = has_editable_parameters
+
         super().build(n_envs)
 
         self._init_vert_fields()
@@ -453,6 +482,10 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 RigidErrorCode.INVALID_ACC_NAN: lambda: (
                     "Invalid accelerations causing 'nan' or 'inf'. Please decrease Rigid simulation timestep, or check "
                     "the controls given to the dofs."
+                ),
+                RigidErrorCode.INVALID_MODEL_NAN: lambda: "A bound rigid physical parameter contains 'nan' or 'inf'.",
+                RigidErrorCode.INVALID_MODEL_GRAD_NAN: lambda: (
+                    "A rigid physical parameter gradient contains 'nan' or 'inf'."
                 ),
             },
         )
@@ -684,6 +717,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             backend=gs.backend,
             para_level=self.sim.para_level,
             requires_grad=self.sim.options.requires_grad,
+            differentiable_parameters=self._has_editable_parameters,
             use_hibernation=self._use_hibernation,
             batch_links_info=self._options.batch_links_info,
             batch_dofs_info=self._options.batch_dofs_info,
@@ -860,7 +894,7 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         rigid_config["enable_jacobi_equilibration"] = (
             not self._enable_mujoco_compatibility
             and rigid_config["solver_type"] == gs.constraint_solver.Newton
-            and self._jacobi_mass_spread_bound() > mass_spread_threshold
+            and (self._has_editable_parameters or self._jacobi_mass_spread_bound() > mass_spread_threshold)
         )
         self.rigid_config = RigidConfig(**rigid_config)
         # Whether a fresh mass matrix spares a substep its assembly, which the substep then asks for (see
@@ -894,6 +928,24 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 gs.raise_exception("Torsional and rolling friction are not supported yet when requires_grad is True.")
 
     def _create_data_manager(self):
+        self._geoms_design_idx = self._vgeoms_design_idx = None
+        if self._has_editable_parameters:
+            entities = [
+                entity
+                for entity in self.entities
+                if isinstance(entity.main_morph, URDF) and entity.main_morph.differentiable_parameters
+            ]
+            geoms_idx = sorted(geom.idx for entity in entities for link in entity.links for geom in link.geoms)
+            vgeoms_idx = sorted(geom.idx for entity in entities for link in entity.links for geom in link.vgeoms)
+            if geoms_idx:
+                self._geoms_design_idx = np.full(self.n_geoms_, -1, dtype=gs.np_int)
+                self._geoms_design_idx[geoms_idx] = np.arange(len(geoms_idx), dtype=gs.np_int)
+                opt_in(RigidData.dyn_info.geoms.design_idx)
+                opt_in(RigidData.dyn_info.geoms_design, design_geoms=len(geoms_idx))
+            if vgeoms_idx:
+                self._vgeoms_design_idx = np.full(self.n_vgeoms, -1, dtype=gs.np_int)
+                self._vgeoms_design_idx[vgeoms_idx] = np.arange(len(vgeoms_idx), dtype=gs.np_int)
+                opt_in(RigidData.dyn_info.vgeoms_design, design_vgeoms=len(vgeoms_idx))
         # We initialize data even if the solver is not active because the coupler needs arguments like
         # rigid_solver.dyn_state.links, etc. regardless of the solver is active or not.
         self.data_manager = RigidData(self, kinematic_only=False)
@@ -1331,6 +1383,43 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
                 self.rigid_config,
             )
 
+            if self._geoms_design_idx is not None:
+                self.dyn_info.geoms.design_idx.from_numpy(self._geoms_design_idx)
+                geoms_design = [geom for geom in geoms if self._geoms_design_idx[geom.idx] >= 0]
+                geoms_pos = np.array([geom.init_pos for geom in geoms_design], dtype=gs.np_float)
+                geoms_size = np.array(
+                    [(1.0, 1.0, 1.0) if geom.type == gs.GEOM_TYPE.MESH else geom.data[:3] for geom in geoms_design],
+                    dtype=gs.np_float,
+                )
+                design_shape = (len(geoms_design), self._B, 3)
+                self.dyn_info.geoms_design.pos.from_numpy(np.broadcast_to(geoms_pos[:, None], design_shape))
+                self.dyn_info.geoms_design.size.from_numpy(np.broadcast_to(geoms_size[:, None], design_shape))
+                self._geoms_affine_idx = np.array([geom.idx for geom in geoms_design], dtype=gs.np_int)
+                self._geoms_affine_design_idx = self._geoms_design_idx[self._geoms_affine_idx]
+                self._geoms_scale_components = np.array(
+                    [
+                        (0, 0, 0)
+                        if geom.type == gs.GEOM_TYPE.SPHERE
+                        else (0, 0, 1)
+                        if geom.type in (gs.GEOM_TYPE.CYLINDER, gs.GEOM_TYPE.CAPSULE)
+                        else (0, 1, 2)
+                        for geom in geoms_design
+                    ],
+                    dtype=gs.np_int,
+                ).reshape((len(geoms_design), 3))
+                self._geoms_scale_reference = np.take_along_axis(
+                    geoms_size[self._geoms_affine_design_idx], self._geoms_scale_components, axis=-1
+                )
+                self._geoms_is_capsule = np.array([geom.type == gs.GEOM_TYPE.CAPSULE for geom in geoms_design])
+
+        if self._vgeoms_design_idx is not None:
+            vgeoms_pos = np.array(
+                [vgeom.init_pos for vgeom in self.vgeoms if self._vgeoms_design_idx[vgeom.idx] >= 0], dtype=gs.np_float
+            )
+            design_shape = (len(vgeoms_pos), self._B, 3)
+            self.dyn_info.vgeoms_design.pos.from_numpy(np.broadcast_to(vgeoms_pos[:, None], design_shape))
+            self.dyn_info.vgeoms_design.scale.from_numpy(np.ones(design_shape, dtype=gs.np_float))
+
     def _init_entity_fields(self):
         if self._entities:
             entities = self._entities
@@ -1747,6 +1836,11 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             qd_zero_grad(self.rigid_info)
             qd_zero_grad(self.dyn_state.geoms)
             qd_zero_grad(self.dyn_state.entities)
+            if self._has_editable_parameters:
+                qd_zero_grad(self.dyn_info.links)
+                qd_zero_grad(self.dyn_info.dofs)
+                qd_zero_grad(self.dyn_info.geoms_design)
+                self._is_neutral_model_reversed = False
 
     def substep_post_coupling(self):
         from genesis.engine.couplers import SAPCoupler, IPCCoupler
@@ -2101,6 +2195,260 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         if self.collider is not None:
             self.collider.reset(envs_idx if self.n_envs > 0 else None, cache_only=False)
 
+    def bind_physical_parameters(
+        self,
+        entity,
+        mass,
+        center_of_mass,
+        inertia,
+        link_offset,
+        collision_offset,
+        box_size,
+        sphere_radius,
+        capsule_size,
+        cylinder_size,
+        mesh_scale,
+        visual_offset,
+        visual_scale,
+    ):
+        if not (isinstance(entity.main_morph, URDF) and entity.main_morph.differentiable_parameters):
+            gs.raise_exception("Set `differentiable_parameters=True` when importing the URDF.")
+
+        links_info = self.dyn_info.links
+        geoms_design, vgeoms_design = self.dyn_info.geoms_design, self.dyn_info.vgeoms_design
+        targets, inputs, links_to_refresh = [], [], []
+        for start, count, design_idx, parameters in (
+            (
+                entity.link_start,
+                entity.n_links,
+                None,
+                (
+                    ("mass", mass, links_info.inertial_mass, (), None, None),
+                    ("center_of_mass", center_of_mass, links_info.inertial_pos, (3,), None, None),
+                    ("inertia", inertia, links_info.inertial_i, (3, 3), None, None),
+                    ("link_offset", link_offset, links_info.pos, (3,), None, None),
+                ),
+            ),
+            (
+                entity.geom_start,
+                entity.n_geoms,
+                self._geoms_design_idx,
+                (
+                    ("collision_offset", collision_offset, geoms_design.pos, (3,), None, None),
+                    ("box_size", box_size, geoms_design.size, (3,), None, gs.GEOM_TYPE.BOX),
+                    ("sphere_radius", sphere_radius, geoms_design.size, (), 0, gs.GEOM_TYPE.SPHERE),
+                    ("capsule_size", capsule_size, geoms_design.size, (2,), slice(2), gs.GEOM_TYPE.CAPSULE),
+                    ("cylinder_size", cylinder_size, geoms_design.size, (2,), slice(2), gs.GEOM_TYPE.CYLINDER),
+                    ("mesh_scale", mesh_scale, geoms_design.size, (3,), None, gs.GEOM_TYPE.MESH),
+                ),
+            ),
+            (
+                entity._vgeom_start,
+                entity.n_vgeoms,
+                self._vgeoms_design_idx,
+                (
+                    ("visual_offset", visual_offset, vgeoms_design.pos, (3,), None, None),
+                    ("visual_scale", visual_scale, vgeoms_design.scale, (3,), None, None),
+                ),
+            ),
+        ):
+            for name, parameter, field, shape, components, geom_type in parameters:
+                if parameter is None:
+                    continue
+                if not isinstance(parameter, PhysicalParameter):
+                    gs.raise_exception(f"`{name}` must be a `gs.engine.entities.PhysicalParameter`.")
+                indices, values = parameter
+                indices = sanitize_index(indices, -1, count, 0, name)
+                indices_np = tensor_to_array(indices)
+                if not indices.numel() or len(np.unique(indices_np)) != len(indices_np):
+                    gs.raise_exception(f"`{name}` requires a nonempty selection of distinct indices.")
+                if (indices_np < 0).any() or (indices_np >= count).any():
+                    gs.raise_exception(f"`{name}` indices must select elements of this entity.")
+                indices = indices + start
+                indices_np = indices_np + start
+                if name == "link_offset" and (self._links_parent_idx[indices_np] < 0).any():
+                    gs.raise_exception("`link_offset` selects non-root links.")
+                if geom_type is not None and any(self.geoms[i_g].type != geom_type for i_g in indices_np):
+                    gs.raise_exception(f"`{name}` requires collision geoms of type {geom_type.name}.")
+                if name == "mesh_scale" and any(not self.geoms[i_g].is_convex for i_g in indices_np):
+                    gs.raise_exception("`mesh_scale` requires convex collision meshes.")
+                if name == "capsule_size" and any(self.geoms[i_g].data[1] <= 0.0 for i_g in indices_np):
+                    gs.raise_exception("`capsule_size` requires an imported capsule with positive segment length.")
+
+                if not isinstance(values, torch.Tensor) or not values.is_floating_point():
+                    gs.raise_exception(f"`{name}` values must be a floating-point Torch tensor.")
+                shape = (indices.numel(), *shape)
+                values = values.to(device=gs.device, dtype=gs.tc_float)
+                if values.shape == shape:
+                    values = values.expand(self._B, *shape)
+                elif self.n_envs == 0 or values.shape != (self.n_envs, *shape):
+                    gs.raise_exception(
+                        f"`{name}` expects shape {shape} or a leading dimension of {self._B} environments."
+                    )
+                values_numeric = values.detach()
+                is_finite = values_numeric.isfinite().all(dim=tuple(range(1, values.ndim)))
+                self.flag_errno(RigidErrorCode.INVALID_MODEL_NAN, ~is_finite)
+                self.check_errno(context=f"Binding rigid physical parameter '{name}'")
+                if (name in ("mass", "visual_scale") or geom_type is not None) and (values_numeric <= 0.0).any():
+                    gs.raise_exception(f"`{name}` values must be strictly positive.")
+                if name == "inertia":
+                    if not torch.allclose(values_numeric, values_numeric.mT, rtol=gs.EPS, atol=gs.EPS):
+                        gs.raise_exception("Link inertia tensors must be symmetric.")
+                    moments = torch.linalg.eigvalsh(
+                        tensor_to_cpu(values_numeric) if values_numeric.device.type == "mps" else values_numeric
+                    )
+                    if ((moments[..., 0] <= 0.0) | (moments[..., 2] > moments[..., :2].sum(dim=-1) + gs.EPS)).any():
+                        gs.raise_exception(
+                            "Link inertia tensors must have positive principal moments satisfying the triangle inequality."
+                        )
+                if design_idx is None:
+                    assert field.has_grad()
+                    links_to_refresh.append(indices)
+                else:
+                    indices = torch.as_tensor(design_idx[indices_np], device=gs.device)
+                targets.append(_ModelParameterTarget(field, indices, components))
+                inputs.append(values if field.has_grad() else values_numeric)
+
+        if targets:
+            links_idx = torch.cat(links_to_refresh).unique() if links_to_refresh else None
+            operation = _BindModelOperation(self, tuple(targets), links_idx)
+            self._rollout_graph.bind_model(entity.uid, operation, *inputs)
+
+    def get_physical_parameters(self, entity) -> RigidPhysicalParameters:
+        if not (isinstance(entity.main_morph, URDF) and entity.main_morph.differentiable_parameters):
+            gs.raise_exception("Set `differentiable_parameters=True` when importing the URDF.")
+        links_idx = slice(entity.link_start, entity.link_end)
+        link_offset = qd_to_torch(self.dyn_info.links.pos, None, links_idx, transpose=True, copy=True)
+        inertial_quat = qd_to_torch(self.dyn_info.links.inertial_quat, None, links_idx, transpose=True, copy=True)
+        env = 0 if self.n_envs == 0 else slice(None)
+        geometry = []
+        for start, count, design_idx, pos, size in (
+            (
+                entity.geom_start,
+                entity.n_geoms,
+                self._geoms_design_idx,
+                self.dyn_info.geoms_design.pos,
+                self.dyn_info.geoms_design.size,
+            ),
+            (
+                entity._vgeom_start,
+                entity.n_vgeoms,
+                self._vgeoms_design_idx,
+                self.dyn_info.vgeoms_design.pos,
+                self.dyn_info.vgeoms_design.scale,
+            ),
+        ):
+            if count:
+                start_design = design_idx[start]
+                selection = slice(start_design, start_design + count)
+                geometry.extend(
+                    qd_to_torch(field, None, selection, transpose=True, copy=True)[env] for field in (pos, size)
+                )
+            else:
+                geometry.extend(
+                    torch.empty((self._B, 0, 3), dtype=gs.tc_float, device=gs.device)[env] for _ in range(2)
+                )
+        collision_offset, collision_size, visual_offset, visual_scale = geometry
+        sizes_by_type = []
+        for geom_type, components in (
+            (gs.GEOM_TYPE.BOX, slice(None)),
+            (gs.GEOM_TYPE.SPHERE, 0),
+            (gs.GEOM_TYPE.CAPSULE, slice(2)),
+            (gs.GEOM_TYPE.CYLINDER, slice(2)),
+            (gs.GEOM_TYPE.MESH, slice(None)),
+        ):
+            selection = tuple(
+                geom.idx - entity.geom_start
+                for geom in entity.geoms
+                if geom.type == geom_type and (geom_type != gs.GEOM_TYPE.MESH or geom.is_convex)
+            )
+            sizes_by_type.append(PhysicalParameter(selection, collision_size[..., selection, components]))
+        box_size, sphere_radius, capsule_size, cylinder_size, mesh_scale = sizes_by_type
+        return RigidPhysicalParameters(
+            mass=self.get_links_mass(links_idx),
+            center_of_mass=self.get_links_COM(links_idx),
+            inertia=self.get_links_inertia(links_idx),
+            inertial_quat=inertial_quat[env],
+            link_offset=link_offset[env],
+            collision_offset=collision_offset,
+            box_size=box_size,
+            sphere_radius=sphere_radius,
+            capsule_size=capsule_size,
+            cylinder_size=cylinder_size,
+            mesh_scale=mesh_scale,
+            visual_offset=visual_offset,
+            visual_scale=visual_scale,
+        )
+
+    @mutates
+    def _write_physical_parameters(self, targets, inputs, links_idx):
+        for (field, indices, components), values in zip(targets, inputs):
+            tensor = qd_to_torch(field, transpose=True, copy=not gs.use_zerocopy)
+            view = tensor if components is None else tensor[..., components]
+            view[:, indices] = values
+            if not gs.use_zerocopy:
+                qd_from_torch(field, tensor.transpose(0, 1).contiguous())
+        if gs.use_zerocopy and gs.backend == gs.metal:
+            torch.mps.synchronize()
+        if links_idx is not None and self.n_dofs:
+            kernel_refresh_model_invweight(
+                links_idx,
+                self.scene._envs_idx,
+                self.dyn_state,
+                self.constraint_solver.constraint_state,
+                self.dyn_info,
+                self.rigid_info,
+                self.rigid_config,
+            )
+        self.refresh_forward_kinematics(self.scene._envs_idx)
+        self.changelog.add(StateChange.GEOMETRY)
+        self.collider.clear()
+        self.constraint_solver.clear()
+        self.constraint_solver.reset()
+
+    def _reverse_neutral_model(self):
+        if self._is_neutral_model_reversed or self.n_dofs == 0:
+            return
+        self._is_neutral_model_reversed = True
+        weight_grads = tuple(
+            qd_to_torch(weights.grad, transpose=True)
+            for weights in (self.dyn_info.links.invweight, self.dyn_info.dofs.invweight)
+        )
+        is_finite = torch.stack([grad.isfinite().all(dim=tuple(range(1, grad.ndim))) for grad in weight_grads]).all(
+            dim=0
+        )
+        self.flag_errno(RigidErrorCode.INVALID_MODEL_GRAD_NAN, ~is_finite)
+        self.check_errno(context="Rigid inverse weights backward")
+        if not any((grad.abs() > 0.0).any() for grad in weight_grads):
+            return
+
+        # Binding precedes all state operations. The neutral replay seeds fresh state adjoints and adds to the
+        # model adjoints carried by the rollout, once before the individual bindings read their slices.
+        qd_zero_grad(self.dyn_state.links)
+        qd_zero_grad(self.dyn_state.dofs)
+        qd_zero_grad(self.dyn_state.joints)
+        qd_zero_grad(self.rigid_info.mass_mat)
+        if gs.use_zerocopy.is_supported and gs.backend == gs.metal:
+            torch.mps.synchronize()
+        envs_idx = self.scene._envs_idx
+        dyn_state, dyn_info, rigid_info, rigid_config = (
+            self.dyn_state,
+            self.dyn_info,
+            self.rigid_info,
+            self.rigid_config,
+        )
+        kernel_forward_kinematics_replay(
+            envs_idx, dyn_state, dyn_info, rigid_info, rigid_config, is_backward=True, neutral=True
+        )
+        kernel_COM_links_replay(dyn_state, dyn_info, rigid_info, rigid_config)
+        kernel_neutral_mass_matrix(envs_idx, dyn_state, dyn_info, rigid_info, rigid_config)
+        kernel_seed_inverse_weight_adjoint(
+            envs_idx, dyn_state, self.constraint_solver.constraint_state, dyn_info, rigid_info, rigid_config
+        )
+        kernel_neutral_mass_matrix.grad(envs_idx, dyn_state, dyn_info, rigid_info, rigid_config)
+        kernel_COM_links_replay.grad(dyn_state, dyn_info, rigid_info, rigid_config)
+        kernel_manual_forward_kinematics_bw(dyn_state, dyn_info, rigid_info, rigid_config, neutral=True)
+
     @mutates
     def _set_links_info(self, values, links_idx, name, envs_idx=None, *, scale_inertia=False):
         """Write one inertial property of the given links, then recompute the inverse weights of their trees once.
@@ -2109,6 +2457,8 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         environment even when the property itself is shared by the whole batch, so writing shared link info recomputes
         them for every environment.
         """
+        if isinstance(values, torch.Tensor) and values.requires_grad:
+            gs.raise_exception("Use `bind_physical_parameters` to differentiate link inertial properties.")
         if not self._options.batch_links_info and envs_idx is not None:
             gs.raise_exception("`envs_idx` cannot be specified for non-batched links info.")
         shape = {"mass": (), "COM": (3,), "inertia": (3, 3)}[name]
@@ -2840,6 +3190,24 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
             tensor = gu.transform_quat_by_quat(gu.inv_quat(offset_quat), tensor)
         return tensor[0] if self.n_envs == 0 else tensor
 
+    def get_geoms_scale(self, envs_idx=None):
+        """Return the global indices of the editable collision geoms and the linear scale of their reference mesh.
+
+        The scale of a capsule stretches its reference mesh along its axis so that its total length matches, which
+        approximates the caps when the radius and the length change by different ratios.
+        """
+        if self._geoms_design_idx is None:
+            return None
+        geoms_size = qd_to_torch(self.dyn_info.geoms_design.size, envs_idx, self._geoms_affine_design_idx, transpose=True)
+        components = torch.as_tensor(self._geoms_scale_components, device=gs.device).expand(geoms_size.shape)
+        sizes = geoms_size.gather(-1, components)
+        reference = torch.as_tensor(self._geoms_scale_reference, device=gs.device)
+        scale = sizes / reference
+        is_capsule = torch.as_tensor(self._geoms_is_capsule, device=gs.device)
+        length = (0.5 * sizes[..., 2] + sizes[..., 0]) / (0.5 * reference[..., 2] + reference[..., 0])
+        scale[..., 2] = torch.where(is_capsule, length, scale[..., 2])
+        return self._geoms_affine_idx, scale
+
     def get_dofs_control_force(self, dofs_idx=None, envs_idx=None, *, copy: bool | None = True):
         tensor = self._read_data(self.dyn_state.dofs.qf_applied, envs_idx, dofs_idx, copy=copy)
         return tensor if tensor is None or self.n_envs > 0 else tensor[0]
@@ -3402,6 +3770,41 @@ class RigidSolver(GravityMixin, TimeBasedMixin, KinematicSolver):
         return gs.List(self._equalities)
 
 
+class _ModelParameterTarget(NamedTuple):
+    field: qd.Tensor
+    indices: torch.Tensor
+    components: int | slice | None
+
+
+class _BindModelOperation(Operation):
+    def __init__(self, solver: RigidSolver, targets: tuple[_ModelParameterTarget, ...], links_idx: torch.Tensor | None):
+        self._solver = weakref.proxy(solver)
+        self._targets = targets
+        self._links_idx = links_idx
+
+    def forward(self, *inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        self._solver._write_physical_parameters(self._targets, inputs, self._links_idx)
+        return ()
+
+    def backward(self) -> tuple[torch.Tensor | None, ...]:
+        if self._links_idx is not None:
+            self._solver._reverse_neutral_model()
+        grads, finite_checks = [], []
+        for field, indices, components in self._targets:
+            if field.has_grad():
+                grad = qd_to_torch(field.grad, None, indices, transpose=True, copy=True)
+                if components is not None:
+                    grad = grad[..., components]
+                finite_checks.append(grad.isfinite().all(dim=tuple(range(1, grad.ndim))))
+            else:
+                grad = None
+            grads.append(grad)
+        is_finite = torch.stack(finite_checks).all(dim=0)
+        self._solver.flag_errno(RigidErrorCode.INVALID_MODEL_GRAD_NAN, ~is_finite)
+        self._solver.check_errno(context="Rigid physical parameters backward")
+        return tuple(grads)
+
+
 @qd.func
 def func_step_1(
     dyn_state: DynState,
@@ -3569,6 +3972,7 @@ class RigidScopedRenderContext(KinematicScopedRenderContext, ScopedRenderContext
             is_active=ArrayRef(self._geoms.is_active, geoms_cols) if self._has_geoms_variants else None,
             aabb_min=ArrayRef(geoms.aabb_min, geoms_cols),
             aabb_max=ArrayRef(geoms.aabb_max, geoms_cols),
+            scale=None if self._geoms_scale is None else self._geoms_scale[:, geoms_cols],
             roles=ShapeRoles.of(
                 [entity.idx for entity in entities],
                 is_looks=is_looks,
@@ -3617,6 +4021,12 @@ class RigidScopedRenderContext(KinematicScopedRenderContext, ScopedRenderContext
             if any(entity.surface.vis_mode == "sdf" and entity.n_geoms > 0 for entity in solver.entities):
                 self._sdf_views.add(NORMAL)
         self._has_geoms_variants = any(geom.active_envs_mask is not None for geom in solver.geoms)
+        # The linear map placing the reference mesh of each collision geom on its editable dimensions, written in place
+        # as the parameters change (see 'update_shapes')
+        self._geoms_scale: torch.Tensor | None = None
+        if solver._geoms_design_idx is not None:
+            eye = torch.eye(3, dtype=gs.tc_float, device=gs.device)
+            self._geoms_scale = eye.repeat(solver.n_envs_, solver.n_geoms, 1, 1)
         self._geoms = RigidRenderGeoms(
             sizes=dict(geoms=solver.n_geoms, envs=solver.n_envs_), unused={VARIANTS: not self._has_geoms_variants}
         )
@@ -3641,6 +4051,23 @@ class RigidScopedRenderContext(KinematicScopedRenderContext, ScopedRenderContext
             mu.hsv_to_rgb(links_hue, saturation=0.8, value=0.95), dtype=gs.tc_float, device=gs.device
         )
         super().build()
+        # The visual geoms posed by their link, whose offset and scale are editable, and their linear scale
+        self._vgeoms_scale: torch.Tensor | None = None
+        if solver._vgeoms_design_idx is not None and self._n_drawn_vgeoms > 0:
+            vgeoms_idx = np.flatnonzero(solver._vgeoms_design_idx >= 0)
+            vgeoms_slot = self._vgeoms_slot[vgeoms_idx]
+            is_drawn = vgeoms_slot < self._n_drawn_vgeoms
+            if is_drawn.any():
+                self._vgeoms_edit_slot = torch.as_tensor(vgeoms_slot[is_drawn], device=gs.device)
+                self._vgeoms_edit_design_idx = torch.as_tensor(
+                    solver._vgeoms_design_idx[vgeoms_idx[is_drawn]], device=gs.device
+                )
+                self._vgeoms_edit_link_idx = torch.as_tensor(
+                    [self._slots_vgeom[i_s].link.idx for i_s in vgeoms_slot[is_drawn]], device=gs.device
+                )
+                eye = torch.eye(3, dtype=gs.tc_float, device=gs.device)
+                self._vgeoms_scale = eye.repeat(solver.n_envs_, self._n_drawn_vgeoms, 1, 1)
+                self._shapes = (self._shapes[0].fork(scale=self._vgeoms_scale), *self._shapes[1:])
         if solver.n_geoms > 0:
             dyn_info = solver.dyn_info
             for geom in solver.geoms:
@@ -3761,7 +4188,26 @@ class RigidScopedRenderContext(KinematicScopedRenderContext, ScopedRenderContext
                         shape.tint.copy_(tint)
                 shapes.append(shape)
             self._shapes = tuple(shapes)
-        return super().update_shapes(envs_idx, view)
+        shapes = super().update_shapes(envs_idx, view)
+        if envs_idx is not None:
+            if self._geoms_scale is not None:
+                geoms_idx, scale = solver.get_geoms_scale()
+                torch.diagonal(self._geoms_scale, dim1=-2, dim2=-1)[:, geoms_idx] = scale
+            if self._vgeoms_scale is not None:
+                vgeoms_design = solver.dyn_info.vgeoms_design
+                design_idx = self._vgeoms_edit_design_idx
+                vgeoms_scale = torch.diagonal(self._vgeoms_scale, dim1=-2, dim2=-1)
+                vgeoms_scale[:, self._vgeoms_edit_slot] = qd_to_torch(vgeoms_design.scale, transpose=True)[:, design_idx]
+                links_idx = self._vgeoms_edit_link_idx
+                vgeoms_pos = gu.transform_by_trans_quat(
+                    qd_to_torch(vgeoms_design.pos, transpose=True)[:, design_idx],
+                    qd_to_torch(solver.dyn_state.links.pos, transpose=True)[:, links_idx],
+                    qd_to_torch(solver.dyn_state.links.quat, transpose=True)[:, links_idx],
+                )
+                render_pos = qd_to_torch(self._data.vgeoms.pos, transpose=True)
+                render_pos[:, self._vgeoms_edit_slot] = vgeoms_pos
+                qd_from_torch(self._data.vgeoms.pos, render_pos.transpose(0, 1).contiguous())
+        return shapes
 
     @property
     def islands(self) -> bool:

@@ -9,5 +9,12 @@ from .pbd_entity import (
     PBDFreeParticleEntity,
     PBDParticleEntity,
 )
-from .rigid_entity import DroneEntity, KinematicEntity, RigidEntity, TerrainEntity
+from .rigid_entity import (
+    DroneEntity,
+    KinematicEntity,
+    PhysicalParameter,
+    RigidEntity,
+    RigidPhysicalParameters,
+    TerrainEntity,
+)
 from .sph_entity import SPHEntity

@@ -11,6 +11,14 @@ from .data import ConstraintState
 
 
 @qd.func
+def func_inverse_weight_grad(grad_D: float, diag_raw: float, diag_slope: float, eps: float):
+    grad_weight = gs.qd_float(0.0)
+    if diag_raw > eps:
+        grad_weight = -grad_D * diag_slope / (diag_raw * diag_raw)
+    return grad_weight
+
+
+@qd.func
 def func_matvec_Ap(i_b: int, constraint_state: ConstraintState, dyn_info: DynInfo, rigid_info: RigidInfo):
     """
     Compute Ap = (M + J^T * diag(D) * J) * p on the current active set, which is used for solving the adjoint u.
@@ -396,6 +404,9 @@ def kernel_manual_add_joint_limit_constraints_bw(
                         if diag_raw > EPS:
                             d_diag_d_imp = -invweight / (imp * imp)
                         d_efc_D_d_imp = -d_diag_d_imp / (diag * diag)
+                        if qd.static(rigid_config.differentiable_parameters):
+                            grad_weight = func_inverse_weight_grad(g_efc_D, diag_raw, (1.0 - imp) / imp, EPS)
+                            dyn_info.dofs.invweight.grad[I_d] = dyn_info.dofs.invweight.grad[I_d] + grad_weight
 
                         # d(imp_x)/d(pos_delta) = sign(pos_delta)/width, and pos_delta < 0 here
                         d_imp_d_pos_delta = d_imp_d_imp_x * (-1.0 / width)
@@ -509,6 +520,7 @@ def kernel_manual_add_collision_constraints_bw(
             g_pen = gs.qd_float(0.0)
             g_d1 = gs.qd_vec3(0.0, 0.0, 0.0)
             g_d2 = gs.qd_vec3(0.0, 0.0, 0.0)
+            g_invweight = gs.qd_float(0.0)
 
             # Forward row layout: equality -> frictionloss -> collision -> joint-limit.
             # Offset past equality + frictionloss.
@@ -523,6 +535,9 @@ def kernel_manual_add_collision_constraints_bw(
 
                 g_aref = constraint_state.dL_daref[n_con, i_b]
                 g_efc_D = constraint_state.dL_defc_D[n_con, i_b]
+                if qd.static(rigid_config.differentiable_parameters):
+                    diag_slope = (1.0 + friction_sq_reg) * 2.0 * friction_sq_reg * (1.0 - imp) / imp
+                    g_invweight = g_invweight + func_inverse_weight_grad(g_efc_D, diag_raw, diag_slope, EPS)
 
                 # aref = -b_coef*jac_qvel + k_coef*imp*penetration  (pos arg = -penetration)
                 d_aref_d_imp = k_coef * penetration
@@ -607,6 +622,10 @@ def kernel_manual_add_collision_constraints_bw(
                 collider_state.contact_data.pos.grad[i_col, i_b][j] = g_pos[j]
                 collider_state.contact_data.normal.grad[i_col, i_b][j] = g_normal[j]
             collider_state.contact_data.penetration.grad[i_col, i_b] = g_pen
+            if qd.static(rigid_config.differentiable_parameters):
+                qd.atomic_add(dyn_info.links.invweight.grad[link_a, i_b][0], g_invweight)
+                if link_b > -1:
+                    qd.atomic_add(dyn_info.links.invweight.grad[link_b, i_b][0], g_invweight)
 
 
 @qd.kernel(fastcache=True)
@@ -619,10 +638,6 @@ def kernel_manual_add_frictionloss_constraints_bw(
 ):
     """Manual reverse of `add_frictionloss_constraints`. See the section header
     above for the shared `n_con` layout and upstream-grad conventions.
-
-    Accumulates into dyn_state.dofs.vel.grad[i_d] only (the conservative, kinematic-
-    state-only target). Model parameters (frictionloss, sol_params, invweight)
-    are not differentiated.
 
     Forward recap (per dof with `frictionloss[I_d] > EPS`, `pos_delta = 0`):
         jac[n_con, i_d] = 1.0
@@ -671,6 +686,14 @@ def kernel_manual_add_frictionloss_constraints_bw(
                         g_aref = constraint_state.dL_daref[n_con, i_b]
                         # jac = 1.0 constant => dL/d_vel = dL/d_jac_qvel.
                         dyn_state.dofs.vel.grad[i_d, i_b] += g_aref * (-b_coef)
+                        if qd.static(rigid_config.differentiable_parameters):
+                            imp, _ = gu.imp_aref(sol_params, 0.0, dyn_state.dofs.vel[i_d, i_b], 0.0)
+                            diag_slope = (1.0 - imp) / imp
+                            g_D = constraint_state.dL_defc_D[n_con, i_b]
+                            grad_weight = func_inverse_weight_grad(
+                                g_D, dyn_info.dofs.invweight[I_d] * diag_slope, diag_slope, EPS
+                            )
+                            dyn_info.dofs.invweight.grad[I_d] = dyn_info.dofs.invweight.grad[I_d] + grad_weight
 
 
 @qd.func
@@ -769,8 +792,6 @@ def kernel_manual_add_equality_constraints_bw(
         CONNECT / WELD:
             dyn_state.links.{pos, quat, root_COM, cd_ang, cd_vel}.grad[link1 / link2]
             dyn_state.dofs.{cdof_ang, cdof_vel, cdofd_ang, cdofd_vel, vel}.grad over each link chain
-    Model parameters (`sol_params`, `eq_data`, `dyn_info.dofs.invweight`,
-    `dyn_info.links.invweight`) are not differentiated.
 
     Forward recap (per equality of type JOINT):
         diff = qpos[i_qpos2] - qpos0[i_qpos2], or 0 when joint2 is omitted
@@ -874,6 +895,13 @@ def kernel_manual_add_equality_constraints_bw(
                 if diag_raw > EPS:
                     d_diag_d_imp = -invweight / (imp * imp)
                 d_efc_D_d_imp = -d_diag_d_imp / (diag * diag)
+                if qd.static(rigid_config.differentiable_parameters):
+                    grad_weight = func_inverse_weight_grad(g_efc_D, diag_raw, (1.0 - imp) / imp, EPS)
+                    dyn_info.dofs.invweight.grad[I_dof1] = dyn_info.dofs.invweight.grad[I_dof1] + grad_weight
+                    if i_joint2 >= 0:
+                        dyn_info.dofs.invweight.grad[i_dof2, i_b] = (
+                            dyn_info.dofs.invweight.grad[i_dof2, i_b] + grad_weight
+                        )
 
                 # imp_x = |pos|/width  =>  d_imp_x/d_pos = sign(pos) / width
                 sign_pos_f = gs.qd_float(1.0)
@@ -973,6 +1001,13 @@ def kernel_manual_add_equality_constraints_bw(
 
                     g_aref = constraint_state.dL_daref[n_con, i_b]
                     g_efc_D = constraint_state.dL_defc_D[n_con, i_b]
+                    if qd.static(rigid_config.differentiable_parameters):
+                        grad_weight = func_inverse_weight_grad(g_efc_D, diag_raw, (1.0 - imp) / imp, EPS)
+                        for i_side in qd.static(range(2)):
+                            link = link1_idx if qd.static(i_side == 0) else link2_idx
+                            dyn_info.links.invweight.grad[link, i_b][0] = (
+                                dyn_info.links.invweight.grad[link, i_b][0] + grad_weight
+                            )
 
                     d_aref_d_jac_qvel = -b_coef
                     d_aref_d_pos_diff_i3_direct = -k_coef * imp
@@ -1178,6 +1213,13 @@ def kernel_manual_add_equality_constraints_bw(
 
                     g_aref = constraint_state.dL_daref[n_con, i_b]
                     g_efc_D = constraint_state.dL_defc_D[n_con, i_b]
+                    if qd.static(rigid_config.differentiable_parameters):
+                        grad_weight = func_inverse_weight_grad(g_efc_D, diag_raw_pos, (1.0 - imp) / imp, EPS)
+                        for i_side in qd.static(range(2)):
+                            link = link1_idx if qd.static(i_side == 0) else link2_idx
+                            dyn_info.links.invweight.grad[link, i_b][0] = (
+                                dyn_info.links.invweight.grad[link, i_b][0] + grad_weight
+                            )
 
                     d_aref_d_jac_qvel = -b_coef
                     d_aref_d_ref_direct = -k_coef * imp
@@ -1251,6 +1293,13 @@ def kernel_manual_add_equality_constraints_bw(
                     n_con_counter = n_con_counter + 1
                     g_aref = constraint_state.dL_daref[n_con, i_b]
                     g_efc_D = constraint_state.dL_defc_D[n_con, i_b]
+                    if qd.static(rigid_config.differentiable_parameters):
+                        grad_weight = func_inverse_weight_grad(g_efc_D, diag_raw_rot, (1.0 - imp) / imp, EPS)
+                        for i_side in qd.static(range(2)):
+                            link = link1_idx if qd.static(i_side == 0) else link2_idx
+                            dyn_info.links.invweight.grad[link, i_b][1] = (
+                                dyn_info.links.invweight.grad[link, i_b][1] + grad_weight
+                            )
 
                     d_aref_d_jac_qvel = -b_coef
                     d_aref_d_ref_direct = -k_coef * imp

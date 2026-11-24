@@ -23,6 +23,8 @@ class RigidErrorCode(ErrorCode):
     INVALID_CONTACT_NAN = auto()
     INVALID_FORCE_NAN = auto()
     INVALID_ACC_NAN = auto()
+    INVALID_MODEL_NAN = auto()
+    INVALID_MODEL_GRAD_NAN = auto()
 
 
 QS = Size("qs")
@@ -30,6 +32,8 @@ DOFS = Size("dofs")
 LINKS = Size("links")
 JOINTS = Size("joints")
 GEOMS = Size("geoms")
+DESIGN_GEOMS = Size("design_geoms")
+DESIGN_VGEOMS = Size("design_vgeoms")
 ROOTS = Size("roots")
 FIXED_ROOTS = Size("fixed_roots")
 TREES = Size("trees")
@@ -46,6 +50,7 @@ LEVEL_SWEEP = "level_sweep"
 TILED_MASS = "tiled_mass"
 # The buffers of the backward pass of the dynamics and of the constraint solve
 BACKWARD = "backward"
+MODEL_GRAD = "model_grad"
 
 
 class RigidInfo(Data, kind=DataKind.CONSTANT):
@@ -184,7 +189,7 @@ class DofsInfo(Data, kind=DataKind.INFO, shape=(DOFS, DOFS_INFO_ENVS)):
     """The model parameters of each dof of the rigid solver, per environment where the options batch them."""
 
     stiffness: qd.Tensor = field(float)
-    invweight: qd.Tensor = field(float)
+    invweight: qd.Tensor = field(float, grad=MODEL_GRAD)
     armature: qd.Tensor = field(float)
     damping: qd.Tensor = field(float)
     frictionloss: qd.Tensor = field(float)
@@ -249,16 +254,16 @@ class LinksInfo(Data, kind=DataKind.INFO, shape=(LINKS, LINKS_INFO_ENVS)):
     dof_end: qd.Tensor = field(int, kind=DataKind.CONSTANT)
     joint_end: qd.Tensor = field(int, kind=DataKind.CONSTANT)
     n_dofs: qd.Tensor = field(int, kind=DataKind.CONSTANT)
-    pos: qd.Tensor = field((float, 3), change=StateChange.GEOMETRY)
+    pos: qd.Tensor = field((float, 3), grad=MODEL_GRAD, change=StateChange.GEOMETRY)
     quat: qd.Tensor = field((float, 4), change=StateChange.GEOMETRY)
-    invweight: qd.Tensor = field((float, 2))
+    invweight: qd.Tensor = field((float, 2), grad=MODEL_GRAD)
     is_fixed: qd.Tensor = field(bool, kind=DataKind.CONSTANT)
     # The slot of a fixed root link in FixedRootsState, -1 for every other link
     fixed_root_idx: qd.Tensor = field(int, kind=DataKind.CONSTANT)
-    inertial_pos: qd.Tensor = field((float, 3))
+    inertial_pos: qd.Tensor = field((float, 3), grad=MODEL_GRAD)
     inertial_quat: qd.Tensor = field((float, 4))
-    inertial_i: qd.Tensor = field((float, (3, 3)))
-    inertial_mass: qd.Tensor = field(float)
+    inertial_i: qd.Tensor = field((float, (3, 3)), grad=MODEL_GRAD)
+    inertial_mass: qd.Tensor = field(float, grad=MODEL_GRAD)
     entity_idx: qd.Tensor = field(int, kind=DataKind.CONSTANT)
     # The geoms of each link, which heterogeneous environments vary
     geom_start: qd.Tensor = field(int, kind=DataKind.CONSTANT)
@@ -372,6 +377,21 @@ class GeomsInfo(Data, kind=DataKind.INFO, shape=(GEOMS,)):
     coup_friction: qd.Tensor = field(float)
     coup_softness: qd.Tensor = field(float)
     coup_restitution: qd.Tensor = field(float)
+    design_idx: qd.Tensor = field(int, kind=DataKind.CONSTANT, opt_in=True)
+
+
+class GeomsDesign(Data, kind=DataKind.INFO, shape=(DESIGN_GEOMS, ENVS)):
+    """The per-environment local positions and dimensions of editable collision geoms."""
+
+    pos: qd.Tensor = field((float, 3), grad=MODEL_GRAD)
+    size: qd.Tensor = field((float, 3), grad=MODEL_GRAD)
+
+
+class VGeomsDesign(Data, kind=DataKind.INFO, shape=(DESIGN_VGEOMS, ENVS)):
+    """The per-environment local positions and scales of editable visual geoms."""
+
+    pos: qd.Tensor = field((float, 3))
+    scale: qd.Tensor = field((float, 3))
 
 
 class GeomsState(Data, kind=DataKind.DERIVED, shape=(GEOMS, ENVS)):
@@ -467,6 +487,8 @@ class DynInfo(Data):
     faces: FacesInfo = field(labels=DYNAMICS)
     edges: EdgesInfo = field(labels=DYNAMICS)
     equalities: EqualitiesInfo = field(labels=DYNAMICS)
+    geoms_design: GeomsDesign = field(opt_in=True)
+    vgeoms_design: VGeomsDesign = field(opt_in=True)
 
 
 class DynState(Data):
@@ -505,6 +527,7 @@ class RigidConfig(Config):
     integrator: gs.integrator
     solver_type: gs.constraint_solver
     requires_grad: bool
+    differentiable_parameters: bool = False
     # -1 to let the dispatch pick, 0 or 1 to force it
     prefer_decomposed_solver: int = -1
     # Whether the Hessian without its cone blocks persists in the mirror slots of nt_H (see nt_H in ConstraintState)
@@ -683,6 +706,7 @@ class RigidData(Data):
                 kinematics=entity_dofs == 0,
             ),
             requires_grad=solver._requires_grad,
+            grad_groups=frozenset((MODEL_GRAD,)) if config.differentiable_parameters else frozenset(),
         )
         if is_external_wrench_exact:
             # Units from 2^-120 up to 2^104 N or N.m, 2^32 apart (see ExactSums)

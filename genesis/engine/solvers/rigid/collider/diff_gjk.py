@@ -3,6 +3,8 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
+from genesis.engine.solvers.rigid.geometry import func_geom_local_aabb, func_geom_local_point, func_geom_size
+
 from . import contact, epa, gjk as GJK
 from .data import ColliderInfo, ColliderState, DiffContactInput, GJKInfo, GJKState
 from .support_field import SupportFieldInfo
@@ -291,7 +293,7 @@ def func_gjk_contact(
         if i_c > 0:
             ref_penetration = default_penetration
         contact_pos, contact_normal, penetration, weight = func_differentiable_contact(
-            i_ga, i_gb, i_b, i_c, ref_penetration, dyn_state, diff_contact_input, collider_info
+            i_ga, i_gb, i_b, i_c, ref_penetration, dyn_state, diff_contact_input, dyn_info, collider_info, replay=False
         )
         if i_c == 0:
             default_penetration = penetration
@@ -676,10 +678,10 @@ def func_add_diff_contact_input(
     gjk_state.diff_contact_input.local_pos1_a[n, i_b] = gjk_state.polytope_verts.local_obj1[i_v1, i_b]
     gjk_state.diff_contact_input.local_pos1_b[n, i_b] = gjk_state.polytope_verts.local_obj1[i_v2, i_b]
     gjk_state.diff_contact_input.local_pos1_c[n, i_b] = gjk_state.polytope_verts.local_obj1[i_v3, i_b]
+    gjk_state.diff_contact_input.w_local_pos1[n, i_b] = localpos1
     gjk_state.diff_contact_input.local_pos2_a[n, i_b] = gjk_state.polytope_verts.local_obj2[i_v1, i_b]
     gjk_state.diff_contact_input.local_pos2_b[n, i_b] = gjk_state.polytope_verts.local_obj2[i_v2, i_b]
     gjk_state.diff_contact_input.local_pos2_c[n, i_b] = gjk_state.polytope_verts.local_obj2[i_v3, i_b]
-    gjk_state.diff_contact_input.w_local_pos1[n, i_b] = localpos1
     gjk_state.diff_contact_input.w_local_pos2[n, i_b] = localpos2
     gjk_state.diff_contact_input.valid[n, i_b] = not (is_face_degenerate or is_origin_outside_face)
     gjk_state.n_diff_contact_input[i_b] += 1
@@ -705,9 +707,9 @@ def func_contact_orthogonals(
     # by the volume of their respective bounding box.
     i_g = i_gb
     if dyn_info.geoms.type[i_ga] != gs.GEOM_TYPE.PLANE:
-        size_ga = rigid_info.geoms_init_AABB[i_ga, 7]
+        _, size_ga = func_geom_local_aabb(i_ga, i_b, dyn_info, rigid_info)
         volume_ga = size_ga[0] * size_ga[1] * size_ga[2]
-        size_gb = rigid_info.geoms_init_AABB[i_gb, 7]
+        _, size_gb = func_geom_local_aabb(i_gb, i_b, dyn_info, rigid_info)
         volume_gb = size_gb[0] * size_gb[1] * size_gb[2]
         i_g = i_ga if volume_ga < volume_gb else i_gb
 
@@ -756,12 +758,11 @@ def func_differentiable_contact(
     ref_penetration: float,
     dyn_state: DynState,
     diff_contact_input: DiffContactInput,
+    dyn_info: DynInfo,
     collider_info: ColliderInfo,
+    replay: qd.template(),
 ):
-    """
-    Compute the contact normal, penetration, and point for contact [i_c] from the corresponding [diff_contact_input]
-    in a differentiable way. The gradients flow through the position and quaternion stored in the [geoms_state].
-    """
+    """Reconstruct a convex contact from its selected witnesses, current poses and dimensions."""
     eps_B = collider_info.diff_contact_eps_boundary[None]
     eps_D = collider_info.diff_contact_eps_distance[None]
 
@@ -777,25 +778,17 @@ def func_differentiable_contact(
     quat1 = dyn_state.geoms.quat[i_ga, i_b]
     quat2 = dyn_state.geoms.quat[i_gb, i_b]
 
-    # Local positions of the vertices that form the contact
-    local_pos1_a = diff_contact_input.local_pos1_a[i_c, i_b]
-    local_pos1_b = diff_contact_input.local_pos1_b[i_c, i_b]
-    local_pos1_c = diff_contact_input.local_pos1_c[i_c, i_b]
-    local_pos2_a = diff_contact_input.local_pos2_a[i_c, i_b]
-    local_pos2_b = diff_contact_input.local_pos2_b[i_c, i_b]
-    local_pos2_c = diff_contact_input.local_pos2_c[i_c, i_b]
-
-    # Support points of the contact
-    w_local_pos1 = diff_contact_input.w_local_pos1[i_c, i_b]
-    w_local_pos2 = diff_contact_input.w_local_pos2[i_c, i_b]
+    witnesses = contact.func_get_contact_witnesses(
+        i_ga, i_gb, i_b, i_c, diff_contact_input, dyn_info, deform=replay, to_rest=False
+    )
 
     # Compute global positions of the vertices
-    pos1a = gu.qd_transform_by_trans_quat(local_pos1_a, trans1, quat1)
-    pos1b = gu.qd_transform_by_trans_quat(local_pos1_b, trans1, quat1)
-    pos1c = gu.qd_transform_by_trans_quat(local_pos1_c, trans1, quat1)
-    pos2a = gu.qd_transform_by_trans_quat(local_pos2_a, trans2, quat2)
-    pos2b = gu.qd_transform_by_trans_quat(local_pos2_b, trans2, quat2)
-    pos2c = gu.qd_transform_by_trans_quat(local_pos2_c, trans2, quat2)
+    pos1a = gu.qd_transform_by_trans_quat(witnesses.vertex_aa, trans1, quat1)
+    pos1b = gu.qd_transform_by_trans_quat(witnesses.vertex_ab, trans1, quat1)
+    pos1c = gu.qd_transform_by_trans_quat(witnesses.vertex_ac, trans1, quat1)
+    pos2a = gu.qd_transform_by_trans_quat(witnesses.vertex_ba, trans2, quat2)
+    pos2b = gu.qd_transform_by_trans_quat(witnesses.vertex_bb, trans2, quat2)
+    pos2c = gu.qd_transform_by_trans_quat(witnesses.vertex_bc, trans2, quat2)
 
     # Compute the vertices on the Minkowski difference
     mink1 = pos1a - pos2a
@@ -831,8 +824,8 @@ def func_differentiable_contact(
     penetration = qd.max(face_normal.dot(face_center), 0.0)
 
     # Compute weight of the contact point.
-    w_pos1 = gu.qd_transform_by_trans_quat(w_local_pos1, trans1, quat1)
-    w_pos2 = gu.qd_transform_by_trans_quat(w_local_pos2, trans2, quat2)
+    w_pos1 = gu.qd_transform_by_trans_quat(witnesses.support_a, trans1, quat1)
+    w_pos2 = gu.qd_transform_by_trans_quat(witnesses.support_b, trans2, quat2)
     w = w_pos1 - w_pos2
 
     # Boundary weight
@@ -864,7 +857,7 @@ def func_plane_contact_frame(i_b: int, i_ga: int, i_gb: int, dyn_state: DynState
     radius = gs.qd_float(0.0)
     geom_type = dyn_info.geoms.type[i_gb]
     if geom_type == gs.GEOM_TYPE.SPHERE or geom_type == gs.GEOM_TYPE.CAPSULE:
-        radius = dyn_info.geoms.data[i_gb][0]
+        radius = func_geom_size(i_gb, i_b, dyn_info)[0]
     return normal, radius
 
 
@@ -902,7 +895,7 @@ def func_differentiable_plane_contact(
 
     normal, radius = func_plane_contact_frame(i_b, i_ga, i_gb, dyn_state, dyn_info)
 
-    core_local = diff_contact_input.core_local[i_c, i_b]
+    core_local = func_geom_local_point(i_gb, i_b, diff_contact_input.core_local[i_c, i_b], dyn_info, to_rest=False)
     core_world = gu.qd_transform_by_trans_quat(core_local, trans_convex, quat_convex)
     v_world = core_world + radius * normal
 

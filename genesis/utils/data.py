@@ -227,7 +227,7 @@ class _FieldSpec(NamedTuple):
     shape: tuple | None = None
     kind: "DataKind | None" = None
     labels: tuple[str, ...] = ()
-    has_grad: bool = False
+    has_grad: bool | str = False
     is_ndarray: bool = False
     opt_in: bool = False
     oversize_hint: str = ""
@@ -241,7 +241,7 @@ def field(
     shape: "tuple[Size | int, ...] | None" = None,
     kind: "DataKind | None" = None,
     labels: str | tuple[str, ...] = (),
-    grad: bool = False,
+    grad: bool | str = False,
     ndarray: bool = False,
     opt_in: bool = False,
     oversize_hint: str = "",
@@ -267,8 +267,9 @@ def field(
     labels : str | tuple[str, ...], optional
         The labels selecting the array, or every array of a member, in the property tables of the constructor.
         Defaults to ().
-    grad : bool, optional
-        Whether the array has gradients when the constructor requires them. Defaults to False.
+    grad : bool | str, optional
+        Whether the array has gradients when the constructor requires them. A named gradient group also requires its
+        name in `grad_groups` of the constructor. Defaults to False.
     ndarray : bool, optional
         Whether the array is an ndarray on every backend. Defaults to False.
     opt_in : bool, optional
@@ -453,6 +454,7 @@ class Data:
         layout: "Mapping[Any, tuple[int, ...] | None] | tuple[int, ...] | None" = None,
         unused: Mapping[Any, bool] | bool | None = None,
         requires_grad: bool = False,
+        grad_groups: frozenset[str] = frozenset(),
         _binds: "Mapping[FieldRef, qd.Tensor] | None" = None,
     ):
         cls = type(self)
@@ -611,7 +613,7 @@ class Data:
                 node_sizes = {}
                 for depth in range(len(node.path) + 1):
                     node_sizes.update(sizes.get(node.path[:depth], {}))
-                value = _allocate(name, node, properties[node.path], node_sizes, values, requires_grad)
+                value = _allocate(name, node, properties[node.path], node_sizes, values, requires_grad, grad_groups)
             object.__setattr__(holder, node.path[-1], value)
 
         # Quadrants assumes the arrays of a kernel argument distinct, so the structs and arrays bound may share none
@@ -724,7 +726,7 @@ def _selection_depth(scope, items, leaf) -> int | None:
     return max(depths, default=None)
 
 
-def _allocate(struct_name, leaf, properties, sizes, values, requires_grad):
+def _allocate(struct_name, leaf, properties, sizes, values, requires_grad, grad_groups):
     # The element type, its base resolved to the precision of the simulation and its element shape to the sizes
     dtype, element_shape = leaf.spec.dtype if isinstance(leaf.spec.dtype, tuple) else (leaf.spec.dtype, ())
     if isinstance(dtype, types.FunctionType):
@@ -787,7 +789,8 @@ def _allocate(struct_name, leaf, properties, sizes, values, requires_grad):
         )
     if leaf.spec.is_ndarray:
         return qd.tensor(dtype, shape=tuple(dims), backend=qd.Backend.NDARRAY)
-    return V(dtype=dtype, shape=tuple(dims), layout=layout, needs_grad=leaf.spec.has_grad and requires_grad)
+    has_grad = leaf.spec.has_grad is True or leaf.spec.has_grad in grad_groups
+    return V(dtype=dtype, shape=tuple(dims), layout=layout, needs_grad=has_grad and requires_grad)
 
 
 class DataKind(IntEnum):

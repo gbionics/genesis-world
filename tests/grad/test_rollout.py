@@ -6,9 +6,116 @@ import pytest
 import torch
 
 import genesis as gs
+from genesis.engine.entities import PhysicalParameter
+from genesis.recorders.trajectory import TRAJECTORY_FORMAT, Trajectory
+from genesis.utils.misc import tensor_to_array
 
 from ..utils.assertions import assert_allclose, assert_equal
 from .utils import make_diff_scene_pair
+
+
+@pytest.mark.required
+def test_rebind_physical_parameters(grad_urdf, tmp_path, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            gravity=(0.0, 0.0, 0.0),
+            requires_grad=True,
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.5, -1.5, 1.1),
+            camera_lookat=(0.5, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    robots = [
+        scene.add_entity(
+            morph=gs.morphs.URDF(
+                file=grad_urdf,
+                pos=(0.0, y, 0.0),
+                fixed=True,
+                differentiable_parameters=True,
+            ),
+        )
+        for y in (0.0, 0.5)
+    ]
+    scene.build(n_envs=2)
+    robot, other_robot = robots
+    links_idx = (robot.get_link("rotor").idx_local,)
+    parameters = robot.get_physical_parameters()
+    length = torch.nn.Parameter(parameters.link_offset.new_tensor(0.28))
+    other_length = torch.nn.Parameter(length.new_tensor([0.24, 0.26]))
+    optimizer = torch.optim.SGD((length, other_length), lr=0.05)
+    axis_x = length.new_tensor((1.0, 0.0, 0.0))
+    axis_z = length.new_tensor((0.0, 0.0, 1.0))
+    mass = (parameters.mass[0, links_idx] + 0.25).requires_grad_()
+    mass_initial = mass.detach().clone()
+    geoms_idx = parameters.box_size.indices
+    checkpoint_path = tmp_path / f"bound_design{TRAJECTORY_FORMAT}"
+    target_x = 0.55
+    loss_initial = None
+
+    for i_rollout in range(2):
+        scene.reset()
+        optimizer.zero_grad()
+        mass.grad = None
+        if i_rollout == 0:
+            with pytest.raises(gs.GenesisException, match="strictly positive"):
+                robot.bind_physical_parameters(
+                    mass=PhysicalParameter(links_idx, mass),
+                    box_size=PhysicalParameter(geoms_idx, -parameters.box_size.values[0]),
+                )
+            assert_equal(robot.get_physical_parameters().mass, parameters.mass)
+        robot.bind_physical_parameters(
+            mass=PhysicalParameter(links_idx, mass) if i_rollout == 0 else None,
+            link_offset=PhysicalParameter(links_idx, (length * axis_x + 0.5 * axis_z)[None]),
+            collision_offset=PhysicalParameter(geoms_idx, (0.5 * length * axis_x)[None]),
+        )
+        other_robot.bind_physical_parameters(
+            link_offset=PhysicalParameter(links_idx, other_length[:, None, None] * axis_x + 0.5 * axis_z),
+        )
+        with torch.no_grad():
+            if i_rollout == 0:
+                mass.add_(1.0)
+            assert_equal(robot.get_physical_parameters().mass[:, links_idx], mass_initial.expand(2, -1))
+            assert_allclose(robot.geoms[0].get_pos()[:, 0], (1.5 * length).expand(2), atol=gs.EPS)
+
+        geom_x = robot.geoms[0].get_pos()[:, 0]
+        robot.control_dofs_force(0.2)
+        scene.step()
+        other_x = other_robot.get_link("rotor").get_pos()[:, 0]
+        with pytest.raises(gs.GenesisException, match="before the rollout"):
+            robot.bind_physical_parameters(mass=PhysicalParameter(links_idx, mass))
+        loss = ((geom_x - target_x).square() + (other_x - target_x).square()).sum()
+        loss = loss + 0.1 * robot.get_dofs_velocity().sum()
+        scene.backward(loss)
+        assert_allclose(length.grad, 6.0 * (1.5 * length - target_x), atol=gs.EPS)
+        assert_allclose(other_length.grad, 2.0 * (other_length - target_x), atol=gs.EPS)
+        if loss_initial is None:
+            assert (mass.grad < -gs.EPS).all()
+            loss_initial = loss.detach()
+            parameters_saved = robot.get_physical_parameters()
+            scene.save_checkpoint(checkpoint_path)
+        else:
+            assert mass.grad is None
+            assert loss < loss_initial
+        optimizer.step()
+
+    stale_loss = robot.get_dofs_velocity().sum()
+    Trajectory(checkpoint_path, scene=scene).seek(-1)
+    with pytest.raises(gs.GenesisException, match="The scene changed since this operation was recorded"):
+        stale_loss.backward()
+
+    parameters_restored = robot.get_physical_parameters()
+    assert_equal(parameters_restored.mass, parameters_saved.mass)
+    assert_equal(parameters_restored.link_offset, parameters_saved.link_offset)
+    assert_equal(parameters_restored.collision_offset, parameters_saved.collision_offset)
+    offset = parameters_restored.link_offset[:, links_idx].requires_grad_()
+    robot.bind_physical_parameters(link_offset=PhysicalParameter(links_idx, offset))
+    robot.get_link("rotor").get_pos()[..., 0].sum().backward()
+    assert_allclose(offset.grad, axis_x, atol=gs.EPS)
 
 
 @pytest.mark.parametrize(

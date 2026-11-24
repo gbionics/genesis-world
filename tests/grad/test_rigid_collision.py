@@ -5,11 +5,157 @@ import pytest
 import torch
 
 import genesis as gs
+from genesis.engine.entities import PhysicalParameter
 from genesis.utils import set_random_seed
 from genesis.utils.geom import R_to_quat
 from genesis.utils.misc import qd_to_numpy, qd_to_torch, tensor_to_array
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+@pytest.mark.parametrize(
+    "design_shape,n_envs",
+    [("box", 0), ("box", 2), ("capsule", 2), ("capsule_pair", 2), ("cylinder", 2), ("sphere", 2), ("mesh", 2)],
+)
+def test_contact_physical_parameter_gradients(
+    design_shape, n_envs, grad_capsule_ground, request, precision, show_viewer
+):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            requires_grad=True,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.2, -1.2, 0.7),
+            camera_lookat=(0.2, 0.0, 0.0),
+        ),
+        show_viewer=show_viewer,
+    )
+    if design_shape in ("mesh", "sphere"):
+        support = scene.add_entity(
+            morph=gs.morphs.Box(
+                size=(1.8, 1.8, 0.2),
+                pos=(0.0, 0.0, -0.1),
+                fixed=True,
+            ),
+        )
+    elif design_shape == "capsule_pair":
+        support = scene.add_entity(
+            morph=gs.morphs.MJCF(
+                file=grad_capsule_ground,
+            ),
+        )
+    else:
+        support = scene.add_entity(
+            morph=gs.morphs.Plane(),
+        )
+    model_shape = "capsule" if design_shape == "capsule_pair" else design_shape
+    model = request.getfixturevalue("grad_urdf" if model_shape == "box" else f"grad_urdf_{model_shape}")
+    if design_shape == "capsule_pair":
+        pos, euler = (1.195, 0.11, -0.417), (12.0, 0.1, 0.0)
+    elif design_shape == "cylinder":
+        pos, euler = (0.0, 0.0, -0.414), (5.0, 0.1, 0.0)
+    else:
+        pos, euler = (0.0, 0.0, -0.34 if design_shape in ("box", "sphere") else -0.31), (12.0, 12.0, 0.0)
+    robot = scene.add_entity(
+        morph=gs.morphs.URDF(
+            file=model,
+            pos=pos,
+            euler=euler,
+            fixed=True,
+            differentiable_parameters=True,
+        ),
+    )
+    # Soft contact keeps the inertial response and the inverse-weight regularization observable together.
+    for geom in (*support.geoms, *robot.geoms):
+        geom.set_sol_params(sol_params=[0.05, 1.0, 0.2, 0.2, 0.001, 0.5, 2.0])
+    scene.build(n_envs=n_envs)
+    links_idx = (robot.get_link("rotor").idx_local,)
+    parameters = robot.get_physical_parameters()
+    geoms_idx = (0,)
+    i_env = 0 if n_envs else slice(None)
+    axis_x = parameters.mass.new_tensor((1.0, 0.0, 0.0))
+    axis_z = parameters.mass.new_tensor((0.0, 0.0, 1.0))
+    inertia_axis = torch.eye(3, dtype=gs.tc_float, device=gs.device)
+
+    def rollout(design):
+        scene.reset()
+        box_size, capsule_size, cylinder_size, sphere_radius, mesh_scale = None, None, None, None, None
+        if design_shape == "box":
+            box_size = PhysicalParameter(
+                geoms_idx, parameters.box_size.values[i_env] + design[..., 3, None, None] * axis_z
+            )
+        elif model_shape in ("capsule", "cylinder"):
+            size_delta = torch.stack((design[..., 3], design[..., 6]), dim=-1)[..., None, :]
+            if model_shape == "capsule":
+                capsule_size = PhysicalParameter(geoms_idx, parameters.capsule_size.values[i_env] + size_delta)
+            else:
+                cylinder_size = PhysicalParameter(geoms_idx, parameters.cylinder_size.values[i_env] + size_delta)
+        elif design_shape == "sphere":
+            sphere_radius = PhysicalParameter(geoms_idx, parameters.sphere_radius.values[i_env] + design[..., 3, None])
+        else:
+            mesh_scale = PhysicalParameter(
+                geoms_idx, parameters.mesh_scale.values[i_env] + 10 * design[..., 3, None, None] * axis_z
+            )
+        robot.bind_physical_parameters(
+            mass=PhysicalParameter(links_idx, parameters.mass[i_env][..., links_idx] + design[..., 0:1]),
+            center_of_mass=PhysicalParameter(
+                links_idx, parameters.center_of_mass[i_env][..., links_idx, :] + design[..., 1, None, None] * axis_x
+            ),
+            inertia=PhysicalParameter(
+                links_idx,
+                parameters.inertia[i_env][..., links_idx, :, :] + design[..., 2, None, None, None] * inertia_axis,
+            ),
+            link_offset=PhysicalParameter(
+                links_idx, parameters.link_offset[i_env][..., links_idx, :] + design[..., 5, None, None] * axis_z
+            ),
+            collision_offset=PhysicalParameter(
+                geoms_idx, parameters.collision_offset[i_env] + design[..., 4, None, None] * axis_z
+            ),
+            box_size=box_size,
+            sphere_radius=sphere_radius,
+            capsule_size=capsule_size,
+            cylinder_size=cylinder_size,
+            mesh_scale=mesh_scale,
+        )
+        robot.control_dofs_force(-8.0)
+        scene.step()
+        n_contacts_start = (robot.get_contacts()["penetration"] > 0.0).sum(dim=-1)
+        vel_at_contact = robot.get_dofs_velocity()[..., 0]
+        scene.step()
+        n_contacts_end = (robot.get_contacts()["penetration"] > 0.0).sum(dim=-1)
+        return vel_at_contact + 0.3 * robot.get_dofs_velocity()[..., 0], n_contacts_start, n_contacts_end
+
+    design = parameters.mass.new_zeros(7 if model_shape in ("capsule", "cylinder") else 6)
+    design[3] = 0.04
+    if n_envs:
+        design = design.expand(n_envs, -1).clone()
+        design[1, 3] = 0.045
+    loss, n_contacts_start, n_contacts_end = rollout(design.requires_grad_())
+    min_contacts = 2 if design_shape in ("box", "capsule_pair", "cylinder") else 1
+    assert (n_contacts_start >= min_contacts).all()
+    assert (n_contacts_end >= min_contacts).all()
+    loss.sum().backward()
+
+    eps = 1e-5 if precision == "64" else 1e-3
+    tol = 2e-7 if precision == "64" else 2e-3
+    directions = torch.eye(design.shape[-1], dtype=gs.tc_float, device=gs.device)
+    with torch.no_grad():
+        slopes = []
+        for direction in directions:
+            loss_plus, n_contacts_start_plus, n_contacts_end_plus = rollout(design + eps * direction)
+            loss_minus, n_contacts_start_minus, n_contacts_end_minus = rollout(design - eps * direction)
+            assert_equal((n_contacts_start_plus, n_contacts_start_minus), n_contacts_start)
+            assert_equal((n_contacts_end_plus, n_contacts_end_minus), n_contacts_end)
+            slopes.append((loss_plus - loss_minus) / (2 * eps))
+        fd = torch.stack(slopes, dim=-1)
+        if n_envs:
+            design_env0 = design.clone()
+            design_env0[0, 3] += eps
+            assert_allclose(rollout(design_env0)[0][1], loss[1], tol=tol)
+    assert_allclose(design.grad, fd, tol=tol)
+    assert (fd.abs() > 5 * tol).all()
 
 
 @pytest.mark.parametrize(

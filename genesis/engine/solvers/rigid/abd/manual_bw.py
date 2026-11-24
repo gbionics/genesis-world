@@ -16,7 +16,13 @@ from genesis.utils.data import eoa
 
 @qd.func
 def func_forward_kinematics_link_bw(
-    i_l: int, i_b: int, dyn_state: DynState, dyn_info: DynInfo, rigid_info: RigidInfo, rigid_config: qd.template()
+    i_l: int,
+    i_b: int,
+    dyn_state: DynState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
+    rigid_config: qd.template(),
+    neutral: qd.template(),
 ):
     """Reverse the forward kinematics of link i_l of env i_b.
 
@@ -26,6 +32,7 @@ def func_forward_kinematics_link_bw(
     I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
     i_parent = dyn_info.links.parent_idx[I_l]
     n_joints = dyn_info.links.joint_end[I_l] - dyn_info.links.joint_start[I_l]
+    qpos = qd.static(rigid_info.qpos0 if neutral else rigid_info.qpos)
 
     # Grad seeded on the final link pose (= slot n_joints), carried backward through the joint chain: after the loop it
     # holds the grad on slot 0 (arm base)
@@ -48,40 +55,42 @@ def func_forward_kinematics_link_bw(
         xaxis_grad = dyn_state.joints.xaxis.grad[i_j, i_b]
 
         if joint_type == gs.JOINT_TYPE.FREE:
-            # Final pose is set absolutely from qpos (slot in unused), xanchor = qpos[0:3]. The forward also publishes
-            # the pose as dofs.pos = (pos, quat_to_xyz(quat)), whose grad (accumulated by the force-stage reverses
-            # through position control / joint stiffness) folds back here.
-            for j in qd.static(range(3)):
-                rigid_info.qpos.grad[q_start + j, i_b] = (
-                    rigid_info.qpos.grad[q_start + j, i_b]
-                    + g_pos[j]
-                    + xanchor_grad[j]
-                    + dyn_state.dofs.pos.grad[dof_start + j, i_b]
+            if qd.static(not neutral):
+                # The free joint sets the pose absolutely from qpos. Both the anchor and the published DOF position
+                # contribute to its adjoint.
+                for j in qd.static(range(3)):
+                    rigid_info.qpos.grad[q_start + j, i_b] = (
+                        rigid_info.qpos.grad[q_start + j, i_b]
+                        + g_pos[j]
+                        + xanchor_grad[j]
+                        + dyn_state.dofs.pos.grad[dof_start + j, i_b]
+                    )
+                q_raw = qd.Vector(
+                    [
+                        qpos[q_start + 3, i_b],
+                        qpos[q_start + 4, i_b],
+                        qpos[q_start + 5, i_b],
+                        qpos[q_start + 6, i_b],
+                    ],
+                    dt=gs.qd_float,
                 )
-            # The forward normalizes the raw qpos quaternion before writing the link quaternion, so the gradient passes
-            # through the Jacobian of the normalization, which has no component along the quaternion.
-            q_raw = qd.Vector(
-                [
-                    rigid_info.qpos[q_start + 3, i_b],
-                    rigid_info.qpos[q_start + 4, i_b],
-                    rigid_info.qpos[q_start + 5, i_b],
-                    rigid_info.qpos[q_start + 6, i_b],
-                ],
-                dt=gs.qd_float,
-            )
-            qhat = gu.qd_normalize(q_raw, rigid_info.EPS[None])
-            g_xyz = qd.Vector(
-                [
-                    dyn_state.dofs.pos.grad[dof_start + 3, i_b],
-                    dyn_state.dofs.pos.grad[dof_start + 4, i_b],
-                    dyn_state.dofs.pos.grad[dof_start + 5, i_b],
-                ],
-                dt=gs.qd_float,
-            )
-            g_quat_eff = g_quat + gu.qd_quat_to_xyz_grad_quat(qhat, rigid_info.EPS[None], g_xyz)
-            g_quat_raw = gu.qd_normalize_grad(q_raw, g_quat_eff, rigid_info.EPS[None])
-            for j in qd.static(range(4)):
-                rigid_info.qpos.grad[q_start + 3 + j, i_b] = rigid_info.qpos.grad[q_start + 3 + j, i_b] + g_quat_raw[j]
+                # The forward normalizes the raw qpos quaternion before writing the link quaternion, so the gradient
+                # passes through the Jacobian of the normalization, which has no component along the quaternion.
+                qhat = gu.qd_normalize(q_raw, rigid_info.EPS[None])
+                g_xyz = qd.Vector(
+                    [
+                        dyn_state.dofs.pos.grad[dof_start + 3, i_b],
+                        dyn_state.dofs.pos.grad[dof_start + 4, i_b],
+                        dyn_state.dofs.pos.grad[dof_start + 5, i_b],
+                    ],
+                    dt=gs.qd_float,
+                )
+                g_quat_eff = g_quat + gu.qd_quat_to_xyz_grad_quat(qhat, rigid_info.EPS[None], g_xyz)
+                g_quat_raw = gu.qd_normalize_grad(q_raw, g_quat_eff, rigid_info.EPS[None])
+                for j in qd.static(range(4)):
+                    rigid_info.qpos.grad[q_start + 3 + j, i_b] = (
+                        rigid_info.qpos.grad[q_start + 3 + j, i_b] + g_quat_raw[j]
+                    )
             for j in qd.static(range(6)):
                 dyn_state.dofs.pos.grad[dof_start + j, i_b] = 0.0
             g_pos = qd.Vector([0.0, 0.0, 0.0], dt=gs.qd_float)
@@ -89,7 +98,7 @@ def func_forward_kinematics_link_bw(
 
         elif joint_type == gs.JOINT_TYPE.REVOLUTE:
             axis = dyn_info.dofs.motion_ang[I_d]
-            angle = rigid_info.qpos[q_start, i_b] - rigid_info.qpos0[q_start, i_b]
+            angle = qpos[q_start, i_b] - rigid_info.qpos0[q_start, i_b]
             rotvec = axis * angle
             qloc = gu.qd_rotvec_to_quat(rotvec)
             # quat_out = transform_quat_by_quat(qloc, quat_in) = quat_mul(quat_in, qloc)
@@ -98,15 +107,14 @@ def func_forward_kinematics_link_bw(
             # pos_out = xanchor - transform(joint_pos_off, quat_out)
             # xanchor = transform(joint_pos_off, quat_in) + pos_in
             gq_out = g_quat - gu.qd_transform_by_quat_grad_quat(joint_pos_off, quat_out, g_pos)
-            g_qloc = gu.qd_quat_mul_grad_rhs(quat_in, qloc, gq_out)
             g_quat_in_apply = gu.qd_quat_mul_grad_lhs(quat_in, qloc, gq_out)
-            rotvec_grad = gu.qd_rotvec_to_quat_grad_rotvec(rotvec, g_qloc)
-            angle_grad = axis[0] * rotvec_grad[0] + axis[1] * rotvec_grad[1] + axis[2] * rotvec_grad[2]
-            # The forward also publishes the angle as dofs.pos[dof_start] = qpos - qpos0, whose grad (accumulated by the
-            # force-stage reverses) folds back linearly.
-            rigid_info.qpos.grad[q_start, i_b] = (
-                rigid_info.qpos.grad[q_start, i_b] + angle_grad + dyn_state.dofs.pos.grad[dof_start, i_b]
-            )
+            if qd.static(not neutral):
+                g_qloc = gu.qd_quat_mul_grad_rhs(quat_in, qloc, gq_out)
+                rotvec_grad = gu.qd_rotvec_to_quat_grad_rotvec(rotvec, g_qloc)
+                angle_grad = axis[0] * rotvec_grad[0] + axis[1] * rotvec_grad[1] + axis[2] * rotvec_grad[2]
+                rigid_info.qpos.grad[q_start, i_b] = (
+                    rigid_info.qpos.grad[q_start, i_b] + angle_grad + dyn_state.dofs.pos.grad[dof_start, i_b]
+                )
             dyn_state.dofs.pos.grad[dof_start, i_b] = 0.0
 
             # grad into xanchor = g_pos (from pos_out) + downstream xanchor_grad
@@ -121,15 +129,14 @@ def func_forward_kinematics_link_bw(
 
         elif joint_type == gs.JOINT_TYPE.PRISMATIC:
             axis = dyn_info.dofs.motion_vel[I_d]
-            displacement = rigid_info.qpos[q_start, i_b] - rigid_info.qpos0[q_start, i_b]
+            displacement = qpos[q_start, i_b] - rigid_info.qpos0[q_start, i_b]
             xaxis = gu.qd_transform_by_quat(axis, quat_in)
             # pos_out = pos_in + xaxis * displacement, quat_out = quat_in
-            displacement_grad = xaxis[0] * g_pos[0] + xaxis[1] * g_pos[1] + xaxis[2] * g_pos[2]
-            # The forward also publishes the displacement as dofs.pos[dof_start] = qpos - qpos0, whose grad (accumulated
-            # by the force-stage reverses) folds back linearly.
-            rigid_info.qpos.grad[q_start, i_b] = (
-                rigid_info.qpos.grad[q_start, i_b] + displacement_grad + dyn_state.dofs.pos.grad[dof_start, i_b]
-            )
+            if qd.static(not neutral):
+                displacement_grad = xaxis[0] * g_pos[0] + xaxis[1] * g_pos[1] + xaxis[2] * g_pos[2]
+                rigid_info.qpos.grad[q_start, i_b] = (
+                    rigid_info.qpos.grad[q_start, i_b] + displacement_grad + dyn_state.dofs.pos.grad[dof_start, i_b]
+                )
             dyn_state.dofs.pos.grad[dof_start, i_b] = 0.0
             g_xaxis = qd.Vector(
                 [
@@ -156,30 +163,31 @@ def func_forward_kinematics_link_bw(
             axis = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
             qloc = qd.Vector(
                 [
-                    rigid_info.qpos[q_start, i_b],
-                    rigid_info.qpos[q_start + 1, i_b],
-                    rigid_info.qpos[q_start + 2, i_b],
-                    rigid_info.qpos[q_start + 3, i_b],
+                    qpos[q_start, i_b],
+                    qpos[q_start + 1, i_b],
+                    qpos[q_start + 2, i_b],
+                    qpos[q_start + 3, i_b],
                 ],
                 dt=gs.qd_float,
             )
             quat_out = gu.qd_transform_quat_by_quat(qloc, quat_in)
             gq_out = g_quat - gu.qd_transform_by_quat_grad_quat(joint_pos_off, quat_out, g_pos)
-            g_qloc = gu.qd_quat_mul_grad_rhs(quat_in, qloc, gq_out)
             g_quat_in_apply = gu.qd_quat_mul_grad_lhs(quat_in, qloc, gq_out)
             # The forward also publishes the joint coordinate as dofs.pos = quat_to_xyz(qloc), whose grad (accumulated
             # by the force-stage reverses) folds back through the Euler extraction.
-            g_xyz = qd.Vector(
-                [
-                    dyn_state.dofs.pos.grad[dof_start, i_b],
-                    dyn_state.dofs.pos.grad[dof_start + 1, i_b],
-                    dyn_state.dofs.pos.grad[dof_start + 2, i_b],
-                ],
-                dt=gs.qd_float,
-            )
-            g_qloc = g_qloc + gu.qd_quat_to_xyz_grad_quat(qloc, rigid_info.EPS[None], g_xyz)
-            for j in qd.static(range(4)):
-                rigid_info.qpos.grad[q_start + j, i_b] = rigid_info.qpos.grad[q_start + j, i_b] + g_qloc[j]
+            if qd.static(not neutral):
+                g_qloc = gu.qd_quat_mul_grad_rhs(quat_in, qloc, gq_out)
+                g_xyz = qd.Vector(
+                    [
+                        dyn_state.dofs.pos.grad[dof_start, i_b],
+                        dyn_state.dofs.pos.grad[dof_start + 1, i_b],
+                        dyn_state.dofs.pos.grad[dof_start + 2, i_b],
+                    ],
+                    dt=gs.qd_float,
+                )
+                g_qloc = g_qloc + gu.qd_quat_to_xyz_grad_quat(qloc, rigid_info.EPS[None], g_xyz)
+                for j in qd.static(range(4)):
+                    rigid_info.qpos.grad[q_start + j, i_b] = rigid_info.qpos.grad[q_start + j, i_b] + g_qloc[j]
             for j in qd.static(range(3)):
                 dyn_state.dofs.pos.grad[dof_start + j, i_b] = 0.0
             g_xanchor = g_pos + xanchor_grad
@@ -207,6 +215,10 @@ def func_forward_kinematics_link_bw(
         parent_quat = dyn_state.links.quat[i_parent, i_b]
         link_off_pos = dyn_info.links.pos[I_l]
         link_off_quat = dyn_info.links.quat[I_l]
+        if qd.static(rigid_config.differentiable_parameters):
+            dyn_info.links.pos.grad[I_l] = dyn_info.links.pos.grad[I_l] + gu.qd_transform_by_quat(
+                g_pos, gu.qd_inv_quat(parent_quat)
+            )
         parent_quat_grad_from_pos = gu.qd_transform_by_quat_grad_quat(link_off_pos, parent_quat, g_pos)
         parent_quat_grad_from_quat = gu.qd_quat_mul_grad_lhs(parent_quat, link_off_quat, g_quat)
         for j in qd.static(range(3)):
@@ -241,7 +253,11 @@ def func_forward_kinematics_link_bw(
 
 @qd.kernel(fastcache=True)
 def kernel_manual_forward_kinematics_bw(
-    dyn_state: DynState, dyn_info: DynInfo, rigid_info: RigidInfo, rigid_config: qd.template()
+    dyn_state: DynState,
+    dyn_info: DynInfo,
+    rigid_info: RigidInfo,
+    rigid_config: qd.template(),
+    neutral: qd.template(),
 ):
     """Manual reverse of kernel_forward_kinematics_replay: link pos / quat grads back to qpos and parent-pose grads.
 
@@ -267,7 +283,7 @@ def kernel_manual_forward_kinematics_bw(
             i_l = i_l_end - 1 - i_l_
             I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
             if dyn_info.links.root_idx[I_l] == i_l_root:
-                func_forward_kinematics_link_bw(i_l, i_b, dyn_state, dyn_info, rigid_info, rigid_config)
+                func_forward_kinematics_link_bw(i_l, i_b, dyn_state, dyn_info, rigid_info, rigid_config, neutral)
 
 
 @qd.func

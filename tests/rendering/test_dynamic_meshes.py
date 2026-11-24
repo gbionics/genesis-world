@@ -6,8 +6,9 @@ import pytest
 import trimesh
 
 import genesis as gs
+from genesis.engine.entities import PhysicalParameter
 from genesis.engine.render_context import DynamicMesh
-from genesis.utils.misc import tensor_to_array
+from genesis.utils.misc import qd_to_numpy, tensor_to_array
 
 from ..conftest import IS_INTERACTIVE_VIEWER_AVAILABLE, SKIP_NO_VIEWER
 from ..utils.assertions import assert_allclose, assert_equal, rgb_array_to_png_bytes
@@ -410,6 +411,74 @@ def test_set_vverts(renderer, show_viewer):
         entity.set_vverts(variant="cube")
     with pytest.raises(gs.GenesisException, match="not both"):
         entity.set_vverts(squashed_verts, variant="squashed")
+
+
+@pytest.mark.required
+def test_render_bound_physical_parameters(renderer, resizable_urdf, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            requires_grad=True,
+        ),
+        vis_options=gs.options.VisOptions(
+            shadow=False,
+            split_envs=True,
+        ),
+        renderer=renderer,
+        show_viewer=show_viewer,
+    )
+    visual = scene.add_entity(
+        morph=gs.morphs.URDF(
+            file=resizable_urdf,
+            pos=(-0.45, 0.0, 0.5),
+            fixed=True,
+            collision=False,
+            differentiable_parameters=True,
+        ),
+    )
+    capsule = scene.add_entity(
+        morph=gs.morphs.URDF(
+            file=resizable_urdf,
+            pos=(0.45, 0.0, 0.5),
+            fixed=True,
+            differentiable_parameters=True,
+        ),
+        surface=gs.surfaces.Default(vis_mode="collision"),
+    )
+    camera = scene.add_camera(
+        res=(192, 144),
+        pos=(0.0, -2.5, 0.5),
+        lookat=(0.0, 0.0, 0.5),
+        fov=35,
+    )
+    scene.build(n_envs=2)
+    _, depth_before, seg_before, _ = camera.render(rgb=False, depth=True, segmentation=True)
+
+    visual_params = visual.get_physical_parameters()
+    visual_scale = visual_params.visual_scale.new_tensor([[[2.0, 1.0, 1.0]], [[1.0, 1.0, 1.0]]])
+    visual_offset = visual_params.visual_offset.new_tensor([[[0.0, 0.0, 0.05]], [[0.0, 0.0, 0.0]]])
+    visual.bind_physical_parameters(
+        visual_offset=PhysicalParameter(None, visual_offset),
+        visual_scale=PhysicalParameter(None, visual_scale),
+    )
+    capsule_size = capsule.get_physical_parameters().capsule_size.values.new_tensor([[[0.075, 0.2]], [[0.15, 0.36]]])
+    capsule.bind_physical_parameters(capsule_size=PhysicalParameter(None, capsule_size))
+
+    verts = visual.get_vverts()
+    assert_allclose(verts.amax(dim=-2) - verts.amin(dim=-2), [[0.48, 0.1, 0.22], [0.24, 0.1, 0.22]], atol=2e-6)
+    assert_allclose((verts.amin(dim=-2) + verts.amax(dim=-2))[..., 2] / 2, [0.55, 0.5], atol=2e-6)
+    assert_equal(verts, visual.vgeoms[0].get_vverts())
+    bounds = capsule.get_AABB()
+    assert_allclose((bounds[:, 1] - bounds[:, 0])[:, 2], [0.35, 0.66], atol=2e-6)
+    assert_allclose(capsule.get_AABB(allow_fast_approx=True), bounds, atol=2e-6)
+
+    _, depth, seg, _ = camera.render(rgb=False, depth=True, segmentation=True)
+    for entity, i_env in ((visual, 0), (capsule, 1)):
+        mask_before, mask = seg_before == entity.idx + 1, seg == entity.idx + 1
+        assert mask[i_env].sum() > 1.5 * mask_before[i_env].sum() > 0
+        assert_equal(mask[1 - i_env], mask_before[1 - i_env])
+    capsule_mask = seg[1] == capsule.idx + 1
+    capsule_mask_before = seg_before[1] == capsule.idx + 1
+    assert depth[1][capsule_mask].min() < depth_before[1][capsule_mask_before].min() - 0.05
 
 
 @pytest.mark.required

@@ -3,7 +3,9 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.data import DynInfo, RigidInfo
+from genesis.engine.solvers.rigid.geometry import func_geom_local_aabb, func_geom_local_point
 from genesis.utils.data import WORKERS, Data, DataKind, field
+
 from . import support_field
 from .constants import MPR_STAGE, MPR_SUPPORT_TYPE, PORTAL_STATUS
 from .contact import func_compute_geom_pair_scale
@@ -189,15 +191,15 @@ def support_driver(
     v = qd.Vector.zero(gs.qd_float, 3)
     geom_type = dyn_info.geoms.type[i_g]
     if geom_type == gs.GEOM_TYPE.SPHERE:
-        v, v_, vid = support_field._func_support_sphere(i_g, direction, pos, quat, dyn_info, shrink=False)
+        v, v_, vid = support_field._func_support_sphere(i_g, i_b, direction, pos, quat, dyn_info, shrink=False)
     elif geom_type == gs.GEOM_TYPE.ELLIPSOID:
-        v = support_field._func_support_ellipsoid(i_g, direction, pos, quat, dyn_info)
+        v, v_ = support_field._func_support_ellipsoid(i_g, direction, pos, quat, dyn_info)
     elif geom_type == gs.GEOM_TYPE.CAPSULE:
-        v = support_field._func_support_capsule(i_g, direction, pos, quat, dyn_info, shrink=False)
+        v, v_ = support_field._func_support_capsule(i_g, i_b, direction, pos, quat, dyn_info, shrink=False)
     elif geom_type == gs.GEOM_TYPE.CYLINDER:
-        v = support_field._func_support_cylinder(i_g, direction, pos, quat, dyn_info, shrink=False)
+        v, v_ = support_field._func_support_cylinder(i_g, i_b, direction, pos, quat, dyn_info, shrink=False)
     elif geom_type == gs.GEOM_TYPE.BOX:
-        v, v_, vid = support_field._func_support_box(i_g, direction, pos, quat, dyn_info)
+        v, v_, vid = support_field._func_support_box(i_g, i_b, direction, pos, quat, dyn_info)
     elif geom_type == gs.GEOM_TYPE.TERRAIN:
         if qd.static(collider_config.has_terrain):
             # Terrain support doesn't depend on geometry pos/quat - uses collider_state.prism
@@ -208,6 +210,7 @@ def support_driver(
         # first of tied vertices where the support table returns any of them (see _func_support_world).
         v, v_, vid = support_field._func_support_world(
             i_g,
+            i_b,
             direction,
             pos,
             quat,
@@ -381,6 +384,7 @@ def mpr_find_penetr_segment(i_b: int, mpr_state: MPRState):
 def guess_geoms_center(
     i_ga: int,
     i_gb: int,
+    i_b: int,
     pos_a: qd.types.vector(3),
     quat_a: qd.types.vector(4),
     pos_b: qd.types.vector(3),
@@ -420,16 +424,20 @@ def guess_geoms_center(
     EPS = rigid_info.EPS[None]
 
     # Transform geometry centers to world space using thread-local pos/quat
-    center_a = gu.qd_transform_by_trans_quat(dyn_info.geoms.center[i_ga], pos_a, quat_a)
-    center_b = gu.qd_transform_by_trans_quat(dyn_info.geoms.center[i_gb], pos_b, quat_b)
+    center_a_local = func_geom_local_point(i_ga, i_b, dyn_info.geoms.center[i_ga], dyn_info, to_rest=False)
+    center_b_local = func_geom_local_point(i_gb, i_b, dyn_info.geoms.center[i_gb], dyn_info, to_rest=False)
+    center_a = gu.qd_transform_by_trans_quat(center_a_local, pos_a, quat_a)
+    center_b = gu.qd_transform_by_trans_quat(center_b_local, pos_b, quat_b)
 
     # Completely different center logics if a normal guess is provided
     if qd.static(not rigid_config.enable_mujoco_compatibility):
         if (qd.abs(normal_ws) > mpr_info.CCD_EPS[None]).any():
             # Must start from the center of each bounding box
-            center_a_local = 0.5 * (rigid_info.geoms_init_AABB[i_ga, 7] + rigid_info.geoms_init_AABB[i_ga, 0])
+            lower_a, upper_a = func_geom_local_aabb(i_ga, i_b, dyn_info, rigid_info)
+            lower_b, upper_b = func_geom_local_aabb(i_gb, i_b, dyn_info, rigid_info)
+            center_a_local = 0.5 * (upper_a + lower_a)
             center_a = gu.qd_transform_by_trans_quat(center_a_local, pos_a, quat_a)
-            center_b_local = 0.5 * (rigid_info.geoms_init_AABB[i_gb, 7] + rigid_info.geoms_init_AABB[i_gb, 0])
+            center_b_local = 0.5 * (upper_b + lower_b)
             center_b = gu.qd_transform_by_trans_quat(center_b_local, pos_b, quat_b)
             delta = center_a - center_b
 
@@ -448,8 +456,8 @@ def guess_geoms_center(
                     dir_offset = offset / offset_norm
                     dir_offset_local_a = gu.qd_inv_transform_by_quat(dir_offset, quat_a)
                     dir_offset_local_b = gu.qd_inv_transform_by_quat(dir_offset, quat_b)
-                    box_size_a = rigid_info.geoms_init_AABB[i_ga, 7] - rigid_info.geoms_init_AABB[i_ga, 0]
-                    box_size_b = rigid_info.geoms_init_AABB[i_gb, 7] - rigid_info.geoms_init_AABB[i_gb, 0]
+                    box_size_a = upper_a - lower_a
+                    box_size_b = upper_b - lower_b
                     length_a = box_size_a.dot(qd.abs(dir_offset_local_a))
                     length_b = box_size_b.dot(qd.abs(dir_offset_local_b))
 
@@ -483,7 +491,7 @@ def func_mpr_contact_from_centers(
 ):
     ccd_tol = mpr_info.CCD_TOLERANCE[None]
     if qd.static(not rigid_config.enable_mujoco_compatibility):
-        ccd_tol = ccd_tol * func_compute_geom_pair_scale(i_ga, i_gb, dyn_info, rigid_info)
+        ccd_tol = ccd_tol * func_compute_geom_pair_scale(i_ga, i_gb, i_b, dyn_info, rigid_info)
 
     is_col = False
     pos = gs.qd_vec3([0.0, 0.0, 0.0])
@@ -760,6 +768,7 @@ def func_mpr_contact(
     center_a, center_b = guess_geoms_center(
         i_ga,
         i_gb,
+        i_b,
         pos_a,
         quat_a,
         pos_b,

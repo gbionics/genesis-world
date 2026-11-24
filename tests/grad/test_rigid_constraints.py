@@ -5,10 +5,67 @@ import pytest
 import torch
 
 import genesis as gs
-from genesis.utils.misc import qd_to_torch
+from genesis.engine.entities import PhysicalParameter
+from genesis.utils.misc import qd_to_torch, tensor_to_array
 
 from ..utils.assertions import assert_allclose
 from .utils import assert_grad_matches_fd, make_diff_scene_pair
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("backend", [gs.cpu, gs.gpu])
+def test_joint_constraint_physical_parameter_gradients(grad_urdf_joint_constraints, precision, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            gravity=(0.0, 0.0, 0.0),
+            requires_grad=True,
+        ),
+        rigid_options=gs.options.RigidOptions(
+            enable_collision=False,
+        ),
+        viewer_options=gs.options.ViewerOptions(
+            camera_pos=(1.2, -1.2, 0.9),
+            camera_lookat=(0.25, 0.0, 0.5),
+        ),
+        show_viewer=show_viewer,
+    )
+    robot = scene.add_entity(
+        morph=gs.morphs.URDF(
+            file=grad_urdf_joint_constraints,
+            fixed=True,
+            differentiable_parameters=True,
+        ),
+    )
+    scene.build(n_envs=2)
+    links_idx = (robot.get_link("rotor").idx_local,)
+    inertia = robot.get_physical_parameters().inertia[:, links_idx]
+    inertia_axis = torch.eye(3, dtype=gs.tc_float, device=gs.device)
+    v_initial = 0.08
+
+    def rollout(inertia_delta):
+        scene.reset()
+        robot.bind_physical_parameters(
+            inertia=PhysicalParameter(links_idx, inertia + inertia_delta[:, None, None, None] * inertia_axis),
+        )
+        robot.set_dofs_position([[0.11, 0.055], [0.0, 0.0]])
+        robot.set_dofs_velocity([v_initial, 0.5 * v_initial])
+        robot.control_dofs_force([0.8, 0.0])
+        scene.step()
+        return robot.get_dofs_velocity()
+
+    inertia_delta = inertia.new_zeros(2, requires_grad=True)
+    vel = rollout(inertia_delta)
+    assert (vel[0] < 0.0).all()
+    assert 0.0 < vel[1, 0] < v_initial
+    assert 0.0 < vel[1, 1] < 0.5 * v_initial
+    vel.sum().backward()
+
+    eps = 1e-5 if precision == "64" else 1e-3
+    tol = 2e-7 if precision == "64" else 5e-5
+    with torch.no_grad():
+        fd = (rollout(inertia_delta + eps) - rollout(inertia_delta - eps)).sum(dim=-1) / (2 * eps)
+    assert_allclose(inertia_delta.grad, fd, tol=tol)
+    assert (fd.abs() > 5 * tol).all()
 
 
 @pytest.mark.required

@@ -462,7 +462,7 @@ class Simulator(BatchedMixin, BuildableMixin, RBC):
         # state, whose gradients it would zero otherwise.
         self._restart()
         for system in self._active_systems:
-            system.__setstate__(state.solvers[type(system).__name__])
+            self._rollout_graph.run_unrecorded(system.__setstate__, state.solvers[type(system).__name__])
         self._steps[:] = torch.as_tensor(state.steps, device=gs.device)
         for solver in self._active_solvers:
             solver.changelog.restore(state.solvers_is_modified[type(solver).__name__])

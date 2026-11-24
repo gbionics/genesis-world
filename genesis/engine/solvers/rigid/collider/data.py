@@ -66,18 +66,18 @@ class DiffContactInput(Data, kind=DataKind.SCRATCH):
 
     geom_a: qd.Tensor = field(int)
     geom_b: qd.Tensor = field(int)
-    # Local positions of the vertices of the two geoms defining the face of the Minkowski difference
+    # Imported local positions of the vertices defining the face of the Minkowski difference
     local_pos1_a: qd.Tensor = field((float, 3))
     local_pos1_b: qd.Tensor = field((float, 3))
     local_pos1_c: qd.Tensor = field((float, 3))
     local_pos2_a: qd.Tensor = field((float, 3))
     local_pos2_b: qd.Tensor = field((float, 3))
     local_pos2_c: qd.Tensor = field((float, 3))
-    # Local positions of the vertices of the two geoms defining the support point of that face
+    # Imported local positions of the vertices defining the support point of that face
     w_local_pos1: qd.Tensor = field((float, 3))
     w_local_pos2: qd.Tensor = field((float, 3))
     # Support core of the convex geom of a plane-convex contact (box vertex, sphere center, nearest capsule endpoint),
-    # in its local frame
+    # in its imported local frame
     core_local: qd.Tensor = field((float, 3))
     # Plane-convex contacts only: whether the detection returned a zero penetration (see
     # func_differentiable_plane_contact)

@@ -1105,7 +1105,7 @@ class URDF(FileMorph):
         Whether the baselink of the entity should be fixed. Defaults to False.
     batch_fixed_verts : bool, optional
         Whether to batch fixed vertices. This will allow setting env-specific poses to fixed geometries, at the cost of
-        significantly increasing memory usage. Default to true. **This is only used for RigidEntity.**
+        more memory. Defaults to True for differentiable parameters and False otherwise.
     prioritize_urdf_material : bool, optional
         Sometimes a geom in a urdf file will be assigned a color or a texture, and the geom asset file also contains its
         own visual material. This parameter controls whether to prioritize the URDF-defined material over the asset's
@@ -1127,14 +1127,20 @@ class URDF(FileMorph):
     xacro_args : dict, optional
         Key-value pairs to override ``xacro:arg`` declarations in the xacro file
         (e.g. ``{"use_sim": "true", "arm_length": "0.5"}``). Only used for ``.xacro`` files. Defaults to ``{}``.
+    differentiable_parameters : bool, optional
+        Enable changing and differentiating physical parameters between rollouts of the same rigid scene. This
+        preserves imported link frames and uses more memory per environment. Leave disabled for a fixed design.
+        Defaults to False.
     """
 
+    batch_fixed_verts: StrictBool | None = None
     fixed: StrictBool = False
     prioritize_urdf_material: StrictBool = False
     merge_fixed_links: StrictBool = True
     links_to_keep: StrArrayType = ()
     default_armature: float | None = Field(default=0.1, ge=0)
     xacro_args: FrozenDictType[str, str] = {}
+    differentiable_parameters: StrictBool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -1149,6 +1155,16 @@ class URDF(FileMorph):
     def model_post_init(self, context: Any) -> None:
         if not (self.is_format(URDF_FORMAT) or self.is_format(XACRO_FORMAT)):
             gs.raise_exception(f"Expected `{URDF_FORMAT}` or `{XACRO_FORMAT}` extension for URDF file: {self.file}")
+        if self.batch_fixed_verts is None:
+            self.batch_fixed_verts = self.differentiable_parameters
+        if self.differentiable_parameters:
+            if self.align:
+                gs.raise_exception("Differentiable URDF parameters require the imported link frames (`align=False`).")
+            if not self.batch_fixed_verts:
+                gs.raise_exception("Differentiable URDF parameters require `batch_fixed_verts=True`.")
+            if self.enable_custom_vverts:
+                gs.raise_exception("Use `visual_offset` and `visual_scale` with differentiable URDF parameters.")
+            self.align = False
 
     def is_format(self, format):
         if isinstance(self.file, urdfpy.URDF):

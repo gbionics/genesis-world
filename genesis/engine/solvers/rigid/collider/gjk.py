@@ -5,6 +5,7 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
+from genesis.engine.solvers.rigid.geometry import func_geom_local_point, func_geom_size
 from . import support_field
 from .constants import EPA_POLY_INIT_RETURN_CODE, GJK_RETURN_CODE, GJK_STAGE, RETURN_CODE
 from .data import ColliderState, GJKConfig, GJKInfo, GJKScratch, GJKState
@@ -201,9 +202,9 @@ def func_gjk_contact(
                 if distance > gjk_info.collision_eps[None]:
                     radius_a, radius_b = 0.0, 0.0
                     if is_sphere_swept_geom_a:
-                        radius_a = dyn_info.geoms.data[i_ga][0]
+                        radius_a = func_geom_size(i_ga, i_b, dyn_info)[0]
                     if is_sphere_swept_geom_b:
-                        radius_b = dyn_info.geoms.data[i_gb][0]
+                        radius_b = func_geom_size(i_gb, i_b, dyn_info)[0]
 
                     wa = gjk_state.witness.point_obj1[0, i_b]
                     wb = gjk_state.witness.point_obj2[0, i_b]
@@ -1465,7 +1466,7 @@ def func_search_valid_simplex_vertex(
             i_v = i_va if i_obj == 0 else i_vb
             pos = pos_a if i_obj == 0 else pos_b
             quat = quat_a if i_obj == 0 else quat_b
-            obj, local_obj = func_get_discrete_geom_vertex(i_g, i_v, pos, quat, dyn_info)
+            obj, local_obj = func_get_discrete_geom_vertex(i_g, i_v, i_b, pos, quat, dyn_info)
             if i_obj == 0:
                 obj1 = obj
                 local_obj1 = local_obj
@@ -1497,7 +1498,7 @@ def func_num_discrete_geom_vertices(i_g: int, dyn_info: DynInfo):
 
 @qd.func
 def func_get_discrete_geom_vertex(
-    i_g: int, i_v: int, pos: qd.types.vector(3), quat: qd.types.vector(4), dyn_info: DynInfo
+    i_g: int, i_v: int, i_b: int, pos: qd.types.vector(3), quat: qd.types.vector(4), dyn_info: DynInfo
 ):
     """
     Get the discrete vertex of the geometry for the given index [i_v].
@@ -1507,19 +1508,20 @@ def func_get_discrete_geom_vertex(
     # Get the vertex position in the local frame of the geometry.
     v_ = qd.Vector([0.0, 0.0, 0.0], dt=gs.qd_float)
     if geom_type == gs.GEOM_TYPE.BOX:
+        size = func_geom_size(i_g, i_b, dyn_info)
         # For the consistency with the [func_support_box] function of [SupportField] class, we handle the box
         # vertex positions in a different way than the general mesh.
         v_ = qd.Vector(
             [
-                (1.0 if (i_v & 1 == 1) else -1.0) * dyn_info.geoms.data[i_g][0] * 0.5,
-                (1.0 if (i_v & 2 == 2) else -1.0) * dyn_info.geoms.data[i_g][1] * 0.5,
-                (1.0 if (i_v & 4 == 4) else -1.0) * dyn_info.geoms.data[i_g][2] * 0.5,
+                (1.0 if (i_v & 1 == 1) else -1.0) * size[0] * 0.5,
+                (1.0 if (i_v & 2 == 2) else -1.0) * size[1] * 0.5,
+                (1.0 if (i_v & 4 == 4) else -1.0) * size[2] * 0.5,
             ],
             dt=gs.qd_float,
         )
     elif geom_type == gs.GEOM_TYPE.MESH:
         vert_start = dyn_info.geoms.vert_start[i_g]
-        v_ = dyn_info.verts.init_pos[vert_start + i_v]
+        v_ = func_geom_local_point(i_g, i_b, dyn_info.verts.init_pos[vert_start + i_v], dyn_info, to_rest=False)
 
     # Transform the vertex position to the world frame using thread-local pos/quat
     v = gu.qd_transform_by_trans_quat(v_, pos, quat)
@@ -1651,7 +1653,7 @@ def func_safe_gjk_support(
 
         if i == 0:
             # Only check support count for the original direction. If unique, we are done.
-            num_supports = func_count_support(i_ga, i_gb, quat_a, quat_b, n_dir, dyn_info, support_field_info)
+            num_supports = func_count_support(i_ga, i_gb, i_b, quat_a, quat_b, n_dir, dyn_info, support_field_info)
             if num_supports > 1:
                 # Ambiguous support (e.g. flat face) - keep as baseline, try perturbed directions.
                 continue
@@ -1674,7 +1676,12 @@ def func_safe_gjk_support(
 
 @qd.func
 def count_support_driver(
-    i_g: int, d: qd.types.vector(3), quat: qd.types.vector(4), dyn_info: DynInfo, support_field_info: SupportFieldInfo
+    i_g: int,
+    i_b: int,
+    d: qd.types.vector(3),
+    quat: qd.types.vector(4),
+    dyn_info: DynInfo,
+    support_field_info: SupportFieldInfo,
 ):
     """
     Count the number of possible support points in the given direction,
@@ -1685,7 +1692,7 @@ def count_support_driver(
     if geom_type == gs.GEOM_TYPE.BOX:
         count = support_field._func_count_supports_box(d, quat)
     elif geom_type == gs.GEOM_TYPE.MESH:
-        count = support_field._func_count_supports_world(i_g, d, quat, support_field_info)
+        count = support_field._func_count_supports_world(i_g, i_b, d, quat, dyn_info, support_field_info)
     return count
 
 
@@ -1693,6 +1700,7 @@ def count_support_driver(
 def func_count_support(
     i_ga: int,
     i_gb: int,
+    i_b: int,
     quat_a: qd.types.vector(4),
     quat_b: qd.types.vector(4),
     dir: qd.types.vector(3),
@@ -1706,11 +1714,12 @@ def func_count_support(
     count = 1
     for i in range(2):
         count *= count_support_driver(
-            i_ga if i == 0 else i_gb,
-            dir if i == 0 else -dir,
-            quat_a if i == 0 else quat_b,
-            dyn_info,
-            support_field_info,
+            i_g=i_ga if i == 0 else i_gb,
+            i_b=i_b,
+            d=dir if i == 0 else -dir,
+            quat=quat_a if i == 0 else quat_b,
+            dyn_info=dyn_info,
+            support_field_info=support_field_info,
         )
 
     return count

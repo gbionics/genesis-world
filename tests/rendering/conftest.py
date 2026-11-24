@@ -1,4 +1,5 @@
 import enum
+import xml.etree.ElementTree as ET
 from importlib.util import find_spec
 
 import pytest
@@ -74,6 +75,19 @@ def skip_if_not_installed(renderer_type):
         # LuisaRenderPy is found through the path that genesis appends as it is imported, which the test module has done
         if find_spec("LuisaRenderPy") is None:
             pytest.skip(SKIP_NO_LUISA)
+
+
+@pytest.fixture(scope="session")
+def resizable_urdf():
+    robot = ET.Element("robot", name="resizable")
+    link = ET.SubElement(robot, "link", name="base")
+    visual = ET.SubElement(link, "visual")
+    geometry = ET.SubElement(visual, "geometry")
+    ET.SubElement(geometry, "box", size="0.24 0.1 0.22")
+    collision = ET.SubElement(link, "collision")
+    geometry = ET.SubElement(collision, "geometry")
+    ET.SubElement(geometry, "capsule", radius="0.075", length="0.20")
+    return ET.tostring(robot, encoding="unicode")
 
 
 @pytest.fixture(scope="session")

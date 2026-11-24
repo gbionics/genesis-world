@@ -113,13 +113,17 @@ def func_collision_clear(
                     collider_state.contact_cache.normal[i_pair, i_b] = qd.Vector.zero(gs.qd_float, 3)
                     collider_state.contact_cache.penetration[i_pair, i_b] = 0.0
 
-        # The box of a link is the box of the link frame moved with the link, which bounds its geoms since their pose
-        # in the link is fixed. A link carrying no geom in an environment gets an empty box, which overlaps nothing.
+        # A link carrying no geom in an environment gets an empty box, which overlaps nothing.
         for i_l in range(i_chunk * n_links // n_chunks, (i_chunk + 1) * n_links // n_chunks):
             I_l = [i_l, i_b] if qd.static(rigid_config.batch_links_info) else i_l
             lower = qd.Vector([qd.math.inf, qd.math.inf, qd.math.inf], dt=gs.qd_float)
             upper = qd.Vector([-qd.math.inf, -qd.math.inf, -qd.math.inf], dt=gs.qd_float)
-            if dyn_info.links.geom_start[I_l] < dyn_info.links.geom_end[I_l]:
+            if qd.static(len(dyn_info.geoms.design_idx.shape) == 1):
+                # The imported link bounds cannot enclose geoms whose size or local translation changes.
+                for i_g in range(dyn_info.links.geom_start[I_l], dyn_info.links.geom_end[I_l]):
+                    lower = qd.min(lower, dyn_state.geoms.aabb_min[i_g, i_b])
+                    upper = qd.max(upper, dyn_state.geoms.aabb_max[i_g, i_b])
+            elif dyn_info.links.geom_start[I_l] < dyn_info.links.geom_end[I_l]:
                 # The bounding box of a rotated box spans its moved center plus or minus its half sizes rotated by |R|
                 l_quat = dyn_state.links.quat[i_l, i_b]
                 aabb_center = 0.5 * (collider_info.links_init_aabb_max[i_l] + collider_info.links_init_aabb_min[i_l])

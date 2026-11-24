@@ -71,7 +71,7 @@ class OperationNode(torch.autograd.Function):
         ctx.graph = weakref.ref(graph)
         ctx.operation = operation
         ctx.set_materialize_grads(False)
-        outputs = graph._run(operation.forward, *inputs)
+        outputs = graph.run_unrecorded(operation.forward, *inputs)
         next_state_handle = state_handle.detach().clone()
         ctx.save_for_backward(next_state_handle, model_handle)
         return next_state_handle, *outputs
@@ -91,7 +91,7 @@ class OperationNode(torch.autograd.Function):
                 e,
             )
         graph._enter_pass()
-        inputs_grad = graph._run(ctx.operation.backward, *outputs_grad)
+        inputs_grad = graph.run_unrecorded(ctx.operation.backward, *outputs_grad)
         # The previous node runs its backward only if it receives a gradient for the state handle it returned
         if state_handle_grad is None:
             state_handle_grad = torch.zeros((), dtype=gs.tc_float, device=gs.device)
@@ -121,6 +121,8 @@ class RolloutGraph:
         self._recorder: LaunchRecorder | None = None
         self._is_calling = False
         self._segment_start = 0
+        self._is_model_boundary = True
+        self._model_bindings: set[object] = set()
         self.restart()
 
     def restart(self):
@@ -131,6 +133,8 @@ class RolloutGraph:
             self._state_handle = torch.zeros((), dtype=gs.tc_float, device=gs.device, requires_grad=True)
             self._model_handle = torch.zeros((), dtype=gs.tc_float, device=gs.device)
             self._recorder = None
+            self._is_model_boundary = True
+            self._model_bindings.clear()
 
     @property
     def is_recording(self) -> bool:
@@ -144,9 +148,22 @@ class RolloutGraph:
 
     def record(self, operation: Operation, *inputs: torch.Tensor) -> list[torch.Tensor]:
         """Run an operation on the state as one node of the graph, and return its outputs."""
+        self._is_model_boundary = False
         state_handle, *outputs = OperationNode.apply(self, operation, self._state_handle, self._model_handle, *inputs)
         self._state_handle = state_handle
         return outputs
+
+    def bind_model(self, key: object, operation: Operation, *inputs: torch.Tensor) -> None:
+        """Bind one part of the model before recording any operations on the state."""
+        if not self._is_model_boundary or key in self._model_bindings:
+            gs.raise_exception("Bind model parameters once per entity after scene.reset() and before the rollout.")
+        if self.is_recording and any(tensor.requires_grad for tensor in inputs):
+            (self._state_handle,) = OperationNode.apply(
+                self, operation, self._state_handle, self._model_handle, *inputs
+            )
+        else:
+            self.run_unrecorded(operation.forward, *inputs)
+        self._model_bindings.add(key)
 
     def record_step(self, operation: Operation) -> None:
         """Run a step as one node of the graph, which starts the recording of the calls after it anew."""
@@ -198,6 +215,7 @@ class RolloutGraph:
     def mark_state_changed(self):
         """Invalidate the last operation recorded, for a change of the state torch records no gradient of."""
         if self._requires_grad and not self._is_running_operation:
+            self._is_model_boundary = False
             increment_version(self._state_handle)
 
     def invalidate(self, change: "StateChange | None" = None, **indices: "IndexType | None") -> None:
@@ -221,13 +239,14 @@ class RolloutGraph:
             # releases of torch Genesis supports.
             torch.autograd.Variable._execution_engine.queue_callback(self._on_pass_end)
 
-    def _run(self, operation_method, *args):
-        """Run the forward or backward pass of a recorded operation, inside which no operation is recorded."""
+    def run_unrecorded(self, operation_method, *args):
+        """Run a managed operation outside rollout recording and invalidation."""
+        was_running_operation = self._is_running_operation
         self._is_running_operation = True
         try:
             return operation_method(*args)
         finally:
-            self._is_running_operation = False
+            self._is_running_operation = was_running_operation
 
 
 # The backward reversing the launches of a kernel, None for a kernel whose launches carry no gradient, by the Python

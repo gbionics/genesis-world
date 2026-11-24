@@ -4,6 +4,7 @@ import genesis as gs
 import genesis.utils.geom as gu
 from genesis.constants import GEOM_TYPE
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
+from genesis.engine.solvers.rigid.geometry import func_geom_local_aabb
 
 
 @qd.func
@@ -115,10 +116,12 @@ def func_is_geom_boxes_overlap(
         and dyn_info.geoms.type[i_gb] != GEOM_TYPE.TERRAIN
     ):
         EPS = rigid_info.EPS[None]
-        half_a = 0.5 * (rigid_info.geoms_init_AABB[i_ga, 7] - rigid_info.geoms_init_AABB[i_ga, 0])
-        half_b = 0.5 * (rigid_info.geoms_init_AABB[i_gb, 7] - rigid_info.geoms_init_AABB[i_gb, 0])
-        center_a = 0.5 * (rigid_info.geoms_init_AABB[i_ga, 7] + rigid_info.geoms_init_AABB[i_ga, 0])
-        center_b = 0.5 * (rigid_info.geoms_init_AABB[i_gb, 7] + rigid_info.geoms_init_AABB[i_gb, 0])
+        lower_a, upper_a = func_geom_local_aabb(i_ga, i_b, dyn_info, rigid_info)
+        lower_b, upper_b = func_geom_local_aabb(i_gb, i_b, dyn_info, rigid_info)
+        half_a = 0.5 * (upper_a - lower_a)
+        half_b = 0.5 * (upper_b - lower_b)
+        center_a = 0.5 * (upper_a + lower_a)
+        center_b = 0.5 * (upper_b + lower_b)
 
         # The axes of box b and the offset of its center, in the frame of box a
         quat_a = dyn_state.geoms.quat[i_ga, i_b]

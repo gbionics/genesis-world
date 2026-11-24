@@ -24,6 +24,7 @@ from .description import (
     _balanced_variant_mapping,
 )
 from .inertial import RHO_MUJOCO, RHO_OBJECT, RHO_ROBOT, compose_inertial_from_g_infos, finalize_inertial
+from .physical_parameters import PhysicalParameter, RigidPhysicalParameters
 from .rigid_equality import RigidEquality
 from .rigid_geom import RigidGeom, RigidVisGeom
 from .rigid_joint import RigidJoint
@@ -2213,6 +2214,84 @@ class RigidEntity(KinematicEntity):
     # ------------------------------------------------------------------------------------
     # ----------------------------- links mass properties --------------------------------
     # ------------------------------------------------------------------------------------
+
+    @gs.assert_built
+    def bind_physical_parameters(
+        self,
+        *,
+        mass: PhysicalParameter | None = None,
+        center_of_mass: PhysicalParameter | None = None,
+        inertia: PhysicalParameter | None = None,
+        link_offset: PhysicalParameter | None = None,
+        collision_offset: PhysicalParameter | None = None,
+        box_size: PhysicalParameter | None = None,
+        sphere_radius: PhysicalParameter | None = None,
+        capsule_size: PhysicalParameter | None = None,
+        cylinder_size: PhysicalParameter | None = None,
+        mesh_scale: PhysicalParameter | None = None,
+        visual_offset: PhysicalParameter | None = None,
+        visual_scale: PhysicalParameter | None = None,
+    ) -> None:
+        """Bind Torch model parameters for a rollout of this rigid entity.
+
+        Enable `differentiable_parameters` on the Unified Robot Description Format (URDF) morph and
+        `requires_grad` on the simulation. Bind once per entity after `scene.reset()` and before setting
+        the initial state, reading differentiable state, or stepping. Backpropagate before resetting.
+
+        Each update selects resolved entity-local link, collision geom or visual geom indices (`None` selects
+        every index). Values have shape `(n_selected, ...)` for a shared design or `(n_envs, n_selected, ...)`
+        for per-environment designs.
+        For a shared design, the backward pass sums gradients over the environments reached by the loss.
+        Omitted values keep their current numeric values and are constants in the new rollout.
+        Full scene checkpoints save the numeric design. Bind fresh Torch inputs after a restore to
+        differentiate the next rollout.
+
+        Mass is in kg, center of mass is a translation in the link frame in meters, and inertia is a
+        3 by 3 tensor in kg*m^2 about the center of mass, expressed in the resolved inertial frame
+        (`get_physical_parameters().inertial_quat`).
+        `link_offset` is the neutral origin of a non-root link in its parent's frame, in meters. Select
+        non-root links explicitly when supplying offsets. Links merged at import share their surviving link's
+        parameters.
+
+        `collision_offset` and `visual_offset` are local translations in the link frame in meters. `box_size`
+        gives three full side lengths. `sphere_radius` gives a radius, and `capsule_size` and `cylinder_size`
+        give a radius and an axial length (the straight segment for a capsule). Select the corresponding geom
+        types when supplying dimensions, which are in meters. `mesh_scale` and `visual_scale` give positive XYZ
+        factors relative to the imported convex collision mesh and visual mesh, respectively. All sizes and scales
+        are positive. Inertial properties are independent of geometry.
+
+        The topology, orientations, and mesh connectivity are fixed. Contact gradients are first order and local
+        to the active contacts, their support features, and the constraint regime. Editable collision geoms
+        support planes and convex rigid partners. Self-collision filtering uses the topology and collision
+        masks for editable pairs because their neutral geometry can change between rollouts.
+
+        Geometry queries, the standard viewer, and rasterized cameras use the bound design. Directional shadow
+        framing uses the imported local bounds for affine mesh resizes. Visual-only parameters and pixels carry no
+        gradients. Batch and ray-traced rendering of resized geometry is outside this interface.
+        """
+        self._solver.bind_physical_parameters(
+            self,
+            mass,
+            center_of_mass,
+            inertia,
+            link_offset,
+            collision_offset,
+            box_size,
+            sphere_radius,
+            capsule_size,
+            cylinder_size,
+            mesh_scale,
+            visual_offset,
+            visual_scale,
+        )
+
+    @gs.assert_built
+    def get_physical_parameters(self) -> RigidPhysicalParameters:
+        """Return copies of the physical parameters in the entity's resolved link and geom order.
+
+        Dimension and collision scale entries include the local indices of the corresponding geom type.
+        """
+        return self._solver.get_physical_parameters(self)
 
     @gs.assert_built
     def get_links_mass(self, links_idx_local=None, envs_idx=None):

@@ -11,16 +11,22 @@ import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.simt as su
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidErrorCode, RigidInfo
+from genesis.engine.solvers.rigid.geometry import (
+    func_deform_geom_point,
+    func_geom_local_aabb,
+    func_geom_local_deformation,
+    func_geom_size,
+)
 from genesis.utils.misc import qd_isfinite
 
 from .constants import CONTACT_ORDER
-from .data import ColliderInfo, ColliderState, GJKState
+from .data import ColliderInfo, ColliderState, DiffContactInput, GJKState
 
 
 @qd.func
 def func_refine_smooth_contact_pos(
     geom_type: int,
-    geom_data: qd.types.vector(7),
+    geom_data: qd.types.vector(3),
     geom_pos: qd.types.vector(3),
     geom_quat: qd.types.vector(4),
     normal: qd.types.vector(3),
@@ -39,8 +45,7 @@ def func_refine_smooth_contact_pos(
 
     Conventions: normal points from geom B to geom A (geom A is the one being refined). The refined contact position
     is the midpoint between A's surface (in the -normal direction from A's center) and the implicit B surface (offset
-    by penetration along normal). Idempotent on the analytical paths (sphere-box, sphere-capsule, capsule-capsule)
-    since those use the same closed-form expression.
+    by penetration along normal). A capsule contact inherits its axial coordinate from the projected midpoint.
     """
     refined = ccd_contact_pos
     if geom_type == gs.GEOM_TYPE.SPHERE:
@@ -96,6 +101,7 @@ def func_refine_smooth_contact_pos(
 def func_apply_smooth_refinement(
     i_ga: int,
     i_gb: int,
+    i_b: int,
     normal: qd.types.vector(3),
     penetration: float,
     contact_pos: qd.types.vector(3),
@@ -109,16 +115,14 @@ def func_apply_smooth_refinement(
     """
     Reconstruct the contact position analytically from the smooth side when one of the geoms is a smooth primitive.
 
-    Idempotent on analytical contact paths; on MPR/GJK paths it removes the position-dependent bias that drives
-    spurious torque and drift on static smooth-vs-polytope contacts. The pose inputs (ga_*/gb_*) must be in the same
-    frame as contact_pos and normal: the detection pose for a directly-added contact, or the unperturbed pose for a
-    multi-contact perturbed contact, which is refined only after the perturbation is reverted so the result lands in
-    the canonical frame the constraint solver stores.
+    This removes the position-dependent bias that drives spurious torque and drift on static smooth-vs-polytope
+    contacts. The pose inputs (ga_*/gb_*) match the frame of contact_pos and normal: the detection pose for a directly
+    added contact, or the unperturbed pose for a secondary contact.
     """
     if qd.static(not rigid_config.enable_mujoco_compatibility):
         # Geom pairs are sorted by ascending type, so smooth primitives (SPHERE/ELLIPSOID/CAPSULE) always sit on the
-        # A side when paired with a polytope (BOX/MESH/TERRAIN/PLANE). Smooth-vs-smooth pairs go through analytical
-        # fast paths and never reach this helper, so at most one side ever needs refinement.
+        # A side when paired with a polytope (BOX/MESH/TERRAIN), while a plane (PLANE) sorts first. When both sides
+        # are smooth, use the first geom's surface to reconstruct the midpoint.
         type_a = dyn_info.geoms.type[i_ga]
         type_b = dyn_info.geoms.type[i_gb]
         if (
@@ -128,7 +132,7 @@ def func_apply_smooth_refinement(
             or type_a == gs.GEOM_TYPE.CYLINDER
         ):
             contact_pos = func_refine_smooth_contact_pos(
-                type_a, dyn_info.geoms.data[i_ga], ga_pos, ga_quat, normal, penetration, contact_pos
+                type_a, func_geom_size(i_ga, i_b, dyn_info), ga_pos, ga_quat, normal, penetration, contact_pos
             )
         elif (
             type_b == gs.GEOM_TYPE.SPHERE
@@ -137,7 +141,7 @@ def func_apply_smooth_refinement(
             or type_b == gs.GEOM_TYPE.CYLINDER
         ):
             contact_pos = func_refine_smooth_contact_pos(
-                type_b, dyn_info.geoms.data[i_gb], gb_pos, gb_quat, -normal, penetration, contact_pos
+                type_b, func_geom_size(i_gb, i_b, dyn_info), gb_pos, gb_quat, -normal, penetration, contact_pos
             )
     return contact_pos
 
@@ -552,6 +556,50 @@ def func_set_contact(
 
 
 @qd.func
+def func_get_contact_witnesses(
+    i_ga: int,
+    i_gb: int,
+    i_b: int,
+    i_c: int,
+    diff_contact_input: DiffContactInput,
+    dyn_info: DynInfo,
+    deform: qd.template(),
+    to_rest: qd.template(),
+):
+    """Read both face triangles and their normal supports, optionally converting shape frames."""
+    points = qd.Matrix.rows(
+        [
+            diff_contact_input.local_pos1_a[i_c, i_b],
+            diff_contact_input.local_pos1_b[i_c, i_b],
+            diff_contact_input.local_pos1_c[i_c, i_b],
+            diff_contact_input.w_local_pos1[i_c, i_b],
+            diff_contact_input.local_pos2_a[i_c, i_b],
+            diff_contact_input.local_pos2_b[i_c, i_b],
+            diff_contact_input.local_pos2_c[i_c, i_b],
+            diff_contact_input.w_local_pos2[i_c, i_b],
+        ]
+    )
+    if qd.static(deform and len(dyn_info.geoms.design_idx.shape) == 1):
+        # Static row indices avoid recording dynamic matrix writes on the reverse stack.
+        for i_side in qd.static(range(2)):
+            i_g = i_ga if qd.static(i_side == 0) else i_gb
+            scale, capsule_half_length, capsule_shift = func_geom_local_deformation(i_g, i_b, dyn_info, to_rest)
+            for i_v in qd.static(range(4 * i_side, 4 * (i_side + 1))):
+                point = points[i_v, :]
+                points[i_v, :] = func_deform_geom_point(point, scale, capsule_half_length, capsule_shift)
+    return qd.Struct(
+        vertex_aa=points[0, :],
+        vertex_ab=points[1, :],
+        vertex_ac=points[2, :],
+        support_a=points[3, :],
+        vertex_ba=points[4, :],
+        vertex_bb=points[5, :],
+        vertex_bc=points[6, :],
+        support_b=points[7, :],
+    )
+
+
+@qd.func
 def func_add_diff_contact_input(
     i_ga: int,
     i_gb: int,
@@ -559,20 +607,25 @@ def func_add_diff_contact_input(
     i_d: int,
     collider_state: ColliderState,
     gjk_state: GJKState,
+    dyn_info: DynInfo,
     collider_info: ColliderInfo,
 ):
     i_c = collider_state.n_contacts[i_b]
     if i_c < collider_info.max_candidate_contacts[None]:
+        # Only the selected witnesses need a rest-space representation. Detection works in the live local frame.
+        witnesses = func_get_contact_witnesses(
+            i_ga, i_gb, i_b, i_d, gjk_state.diff_contact_input, dyn_info, deform=True, to_rest=True
+        )
         collider_state.diff_contact_input.geom_a[i_c, i_b] = i_ga
         collider_state.diff_contact_input.geom_b[i_c, i_b] = i_gb
-        collider_state.diff_contact_input.local_pos1_a[i_c, i_b] = gjk_state.diff_contact_input.local_pos1_a[i_d, i_b]
-        collider_state.diff_contact_input.local_pos1_b[i_c, i_b] = gjk_state.diff_contact_input.local_pos1_b[i_d, i_b]
-        collider_state.diff_contact_input.local_pos1_c[i_c, i_b] = gjk_state.diff_contact_input.local_pos1_c[i_d, i_b]
-        collider_state.diff_contact_input.local_pos2_a[i_c, i_b] = gjk_state.diff_contact_input.local_pos2_a[i_d, i_b]
-        collider_state.diff_contact_input.local_pos2_b[i_c, i_b] = gjk_state.diff_contact_input.local_pos2_b[i_d, i_b]
-        collider_state.diff_contact_input.local_pos2_c[i_c, i_b] = gjk_state.diff_contact_input.local_pos2_c[i_d, i_b]
-        collider_state.diff_contact_input.w_local_pos1[i_c, i_b] = gjk_state.diff_contact_input.w_local_pos1[i_d, i_b]
-        collider_state.diff_contact_input.w_local_pos2[i_c, i_b] = gjk_state.diff_contact_input.w_local_pos2[i_d, i_b]
+        collider_state.diff_contact_input.local_pos1_a[i_c, i_b] = witnesses.vertex_aa
+        collider_state.diff_contact_input.local_pos1_b[i_c, i_b] = witnesses.vertex_ab
+        collider_state.diff_contact_input.local_pos1_c[i_c, i_b] = witnesses.vertex_ac
+        collider_state.diff_contact_input.w_local_pos1[i_c, i_b] = witnesses.support_a
+        collider_state.diff_contact_input.local_pos2_a[i_c, i_b] = witnesses.vertex_ba
+        collider_state.diff_contact_input.local_pos2_b[i_c, i_b] = witnesses.vertex_bb
+        collider_state.diff_contact_input.local_pos2_c[i_c, i_b] = witnesses.vertex_bc
+        collider_state.diff_contact_input.w_local_pos2[i_c, i_b] = witnesses.support_b
         # The first contact point is the reference contact point
         collider_state.diff_contact_input.ref_id[i_c, i_b] = i_c - i_d
         collider_state.diff_contact_input.ref_penetration[i_c, i_b] = gjk_state.diff_contact_input.ref_penetration[
@@ -581,50 +634,49 @@ def func_add_diff_contact_input(
 
 
 @qd.func
-def func_compute_geom_rbound(i_g: int, dyn_info: DynInfo, rigid_info: RigidInfo):
+def func_compute_geom_rbound(i_g: int, i_b: int, dyn_info: DynInfo, rigid_info: RigidInfo):
     """Compute the bounding sphere radius for a geom, matching MuJoCo's geom_rbound."""
     geom_type = dyn_info.geoms.type[i_g]
+    size = func_geom_size(i_g, i_b, dyn_info)
     rbound = gs.qd_float(0.0)
     if geom_type == gs.GEOM_TYPE.SPHERE:
-        rbound = dyn_info.geoms.data[i_g][0]
+        rbound = size[0]
     elif geom_type == gs.GEOM_TYPE.CAPSULE:
         # radius + half_length (MuJoCo stores size as [radius, half_length])
         # Genesis stores data as [radius, full_length], so half_length = 0.5 * data[1]
-        rbound = dyn_info.geoms.data[i_g][0] + 0.5 * dyn_info.geoms.data[i_g][1]
+        rbound = size[0] + 0.5 * size[1]
     elif geom_type == gs.GEOM_TYPE.ELLIPSOID:
-        rbound = qd.max(dyn_info.geoms.data[i_g][0], qd.max(dyn_info.geoms.data[i_g][1], dyn_info.geoms.data[i_g][2]))
+        rbound = size.max()
     elif geom_type == gs.GEOM_TYPE.BOX:
-        d0 = dyn_info.geoms.data[i_g][0]
-        d1 = dyn_info.geoms.data[i_g][1]
-        d2 = dyn_info.geoms.data[i_g][2]
-        rbound = qd.sqrt(d0 * d0 + d1 * d1 + d2 * d2)
+        rbound = size.norm()
     else:
         # For mesh and other types, approximate as half AABB diagonal
-        rbound = 0.5 * (rigid_info.geoms_init_AABB[i_g, 7] - rigid_info.geoms_init_AABB[i_g, 0]).norm()
+        lower, upper = func_geom_local_aabb(i_g, i_b, dyn_info, rigid_info)
+        rbound = 0.5 * (upper - lower).norm()
     return rbound
 
 
 @qd.func
-def func_compute_geom_pair_scale(i_ga: int, i_gb: int, dyn_info: DynInfo, rigid_info: RigidInfo):
+def func_compute_geom_pair_scale(i_ga: int, i_gb: int, i_b: int, dyn_info: DynInfo, rigid_info: RigidInfo):
     # Intrinsic length scale of a geom pair: half the smaller geom's world-aligned bounding-box diagonal. The
     # original (rest-pose) AABB is used so the scale is a constant independent of the current orientation, which
     # makes sense since the size of the geometries is an intrinsic property. Multiply by a relative tolerance to
     # turn it into an absolute one.
-    aabb_size_b = (rigid_info.geoms_init_AABB[i_gb, 7] - rigid_info.geoms_init_AABB[i_gb, 0]).norm()
-    aabb_size = aabb_size_b
+    lower_b, upper_b = func_geom_local_aabb(i_gb, i_b, dyn_info, rigid_info)
+    aabb_size = (upper_b - lower_b).norm()
     if dyn_info.geoms.type[i_ga] != gs.GEOM_TYPE.PLANE:
-        aabb_size_a = (rigid_info.geoms_init_AABB[i_ga, 7] - rigid_info.geoms_init_AABB[i_ga, 0]).norm()
-        aabb_size = qd.min(aabb_size_a, aabb_size_b)
+        lower_a, upper_a = func_geom_local_aabb(i_ga, i_b, dyn_info, rigid_info)
+        aabb_size = qd.min((upper_a - lower_a).norm(), aabb_size)
 
     return 0.5 * aabb_size
 
 
 @qd.func
-def func_compute_geom_pair_scale_mj(i_ga: int, i_gb: int, dyn_info: DynInfo, rigid_info: RigidInfo):
+def func_compute_geom_pair_scale_mj(i_ga: int, i_gb: int, i_b: int, dyn_info: DynInfo, rigid_info: RigidInfo):
     """Geom-pair length scale matching MuJoCo's formula: min(rbound_g1, rbound_g2). Multiply by a relative tolerance
     to recover MuJoCo's absolute tolerance."""
-    rbound_a = func_compute_geom_rbound(i_ga, dyn_info, rigid_info)
-    rbound_b = func_compute_geom_rbound(i_gb, dyn_info, rigid_info)
+    rbound_a = func_compute_geom_rbound(i_ga, i_b, dyn_info, rigid_info)
+    rbound_b = func_compute_geom_rbound(i_gb, i_b, dyn_info, rigid_info)
     return qd.min(rbound_a, rbound_b)
 
 
@@ -632,6 +684,7 @@ def func_compute_geom_pair_scale_mj(i_ga: int, i_gb: int, dyn_info: DynInfo, rig
 def func_compute_mc_tolerance(
     i_ga: int,
     i_gb: int,
+    i_b: int,
     dyn_info: DynInfo,
     rigid_info: RigidInfo,
     collider_info: ColliderInfo,
@@ -642,9 +695,11 @@ def func_compute_mc_tolerance(
     Shared by every convex narrowphase arm so the accepted contact set stays backend-independent. The relative
     tolerance scales with the reference engine's pair scale under MuJoCo compatibility and with the intrinsic pair
     scale otherwise."""
-    scale = func_compute_geom_pair_scale(i_ga, i_gb, dyn_info, rigid_info)
+    scale = gs.qd_float(0.0)
     if qd.static(rigid_config.enable_mujoco_compatibility):
-        scale = func_compute_geom_pair_scale_mj(i_ga, i_gb, dyn_info, rigid_info)
+        scale = func_compute_geom_pair_scale_mj(i_ga, i_gb, i_b, dyn_info, rigid_info)
+    else:
+        scale = func_compute_geom_pair_scale(i_ga, i_gb, i_b, dyn_info, rigid_info)
     return collider_info.mc_tolerance[None] * scale
 
 
@@ -683,9 +738,9 @@ def func_contact_orthogonals(
         # by the volume of their respective bounding box.
         i_g = i_gb
         if dyn_info.geoms.type[i_ga] != gs.GEOM_TYPE.PLANE:
-            size_ga = rigid_info.geoms_init_AABB[i_ga, 7]
+            _, size_ga = func_geom_local_aabb(i_ga, i_b, dyn_info, rigid_info)
             volume_ga = size_ga[0] * size_ga[1] * size_ga[2]
-            size_gb = rigid_info.geoms_init_AABB[i_gb, 7]
+            _, size_gb = func_geom_local_aabb(i_gb, i_b, dyn_info, rigid_info)
             volume_gb = size_gb[0] * size_gb[1] * size_gb[2]
             i_g = i_ga if volume_ga < volume_gb else i_gb
 

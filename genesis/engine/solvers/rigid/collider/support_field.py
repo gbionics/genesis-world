@@ -8,7 +8,9 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.data import GEOMS, DynInfo
+from genesis.engine.solvers.rigid.geometry import func_geom_size, func_mesh_scale
 from genesis.utils.data import Data, DataKind, Size, field, is_opted_in
+
 from .data import ColliderState
 
 
@@ -173,6 +175,7 @@ def _kernel_init_support(
 @qd.func
 def _func_support_world(
     i_g: int,
+    i_b: int,
     d: qd.types.vector(3),
     pos: qd.types.vector(3),
     quat: qd.types.vector(4),
@@ -190,13 +193,22 @@ def _func_support_world(
     v = qd.Vector.zero(gs.qd_float, 3)
     v_ = qd.Vector.zero(gs.qd_float, 3)
     vid = 0
+    scale = func_mesh_scale(i_g, i_b, dyn_info)
     if qd.static(exhaustive):
         d_mesh = gu.qd_transform_by_quat(d, gu.qd_inv_quat(quat))
+        if qd.static(len(dyn_info.geoms.design_idx.shape) == 1):
+            d_mesh = d_mesh * scale
         v_, vid = _func_support_mesh_exhaustive(i_g, d_mesh, dyn_info)
+        if qd.static(len(dyn_info.geoms.design_idx.shape) == 1):
+            v_ = v_ * scale
         v = gu.qd_transform_by_trans_quat(v_, pos, quat)
     else:
         d_mesh = gu.qd_transform_by_quat_fast(d, gu.qd_inv_quat(quat))
+        if qd.static(len(dyn_info.geoms.design_idx.shape) == 1):
+            d_mesh = (d_mesh * scale).normalized()
         v_, vid = _func_support_mesh(i_g, d_mesh, dyn_info, support_field_info)
+        if qd.static(len(dyn_info.geoms.design_idx.shape) == 1):
+            v_ = v_ * scale
         v = gu.qd_transform_by_trans_quat_fast(v_, pos, quat)
     return v, v_, vid
 
@@ -293,10 +305,16 @@ def _func_support_mesh_exhaustive(i_g: int, d_mesh: qd.types.vector(3), dyn_info
 
 @qd.func
 def _func_support_sphere(
-    i_g: int, d: qd.types.vector(3), pos: qd.types.vector(3), quat: qd.types.vector(4), dyn_info: DynInfo, shrink: bool
+    i_g: int,
+    i_b: int,
+    d: qd.types.vector(3),
+    pos: qd.types.vector(3),
+    quat: qd.types.vector(4),
+    dyn_info: DynInfo,
+    shrink: bool,
 ):
     sphere_center = pos
-    sphere_radius = dyn_info.geoms.data[i_g][0]
+    sphere_radius = func_geom_size(i_g, i_b, dyn_info)[0]
 
     # Shrink the sphere to a point
     v = sphere_center
@@ -330,40 +348,46 @@ def _func_support_ellipsoid(
     norm = qd.sqrt(a * a * d_local[0] ** 2 + b * b * d_local[1] ** 2 + c * c * d_local[2] ** 2)
     s_local = qd.Vector([sx / norm, sy / norm, sz / norm], dt=gs.qd_float)
 
-    return pos + gu.qd_transform_by_quat(s_local, quat)
+    return pos + gu.qd_transform_by_quat(s_local, quat), s_local
 
 
 @qd.func
 def _func_support_capsule(
-    i_g: int, d: qd.types.vector(3), pos: qd.types.vector(3), quat: qd.types.vector(4), dyn_info: DynInfo, shrink: bool
+    i_g: int,
+    i_b: int,
+    d: qd.types.vector(3),
+    pos: qd.types.vector(3),
+    quat: qd.types.vector(4),
+    dyn_info: DynInfo,
+    shrink: bool,
 ):
-    """
-    Support function for capsule geometry.
-
-    Thread-safety note: Fully migrated to use explicit pos/quat parameters.
-    The i_g parameter is only used for read-only metadata access (radius, halflength)
-    from geoms_info, which is thread-safe. Does not access geoms_state.
-    """
-    res = gs.qd_vec3(0, 0, 0)
-    capsule_center = pos
-    capsule_radius = dyn_info.geoms.data[i_g][0]
-    capsule_halflength = 0.5 * dyn_info.geoms.data[i_g][1]
-
+    """Find a support point on the capsule or its axial segment."""
+    size = func_geom_size(i_g, i_b, dyn_info)
+    radius = size[0]
+    half_length = 0.5 * size[1]
+    local_dir = gu.qd_inv_transform_by_quat(d, quat)
+    local_pos = gs.qd_vec3(0.0, 0.0, half_length if local_dir[2] >= 0.0 else -half_length)
+    world_pos = pos
     if shrink:
-        local_dir = gu.qd_transform_by_quat(d, gu.qd_inv_quat(quat))
-        res[2] = capsule_halflength if local_dir[2] >= 0.0 else -capsule_halflength
-        res = gu.qd_transform_by_trans_quat(res, capsule_center, quat)
+        world_pos = gu.qd_transform_by_trans_quat(local_pos, pos, quat)
     else:
         capsule_axis = gu.qd_transform_by_quat(qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float), quat)
         capsule_endpoint_side = -1.0 if d.dot(capsule_axis) < 0.0 else 1.0
-        capsule_endpoint = capsule_center + capsule_halflength * capsule_endpoint_side * capsule_axis
-        res = capsule_endpoint + d * capsule_radius
-    return res
+        axial = half_length * capsule_endpoint_side
+        world_pos = pos + axial * capsule_axis + d * radius
+        local_pos = gs.qd_vec3(0.0, 0.0, axial) + local_dir * radius
+    return world_pos, local_pos
 
 
 @qd.func
 def _func_support_cylinder(
-    i_g: int, d: qd.types.vector(3), pos: qd.types.vector(3), quat: qd.types.vector(4), dyn_info: DynInfo, shrink: bool
+    i_g: int,
+    i_b: int,
+    d: qd.types.vector(3),
+    pos: qd.types.vector(3),
+    quat: qd.types.vector(4),
+    dyn_info: DynInfo,
+    shrink: bool,
 ):
     """
     Support function for cylinder geometry.
@@ -373,8 +397,9 @@ def _func_support_cylinder(
     instead displace along d itself). When d is axial the radial part vanishes and the support is the cap centre.
     With 'shrink', the support is the cap centre for any d.
     """
-    radius = dyn_info.geoms.data[i_g][0]
-    halflength = 0.5 * dyn_info.geoms.data[i_g][1]
+    size = func_geom_size(i_g, i_b, dyn_info)
+    radius = size[0]
+    halflength = 0.5 * size[1]
     # The point is built in the frame of the cylinder, where the radial part of d has no axial component. Removing the
     # axial component in world frame leaves its rounding, which the division by the radial norm amplifies as d aligns
     # with the axis, lifting the point off the cap by the radius times the ratio of that rounding to the radial part.
@@ -385,7 +410,7 @@ def _func_support_cylinder(
         if d_radial_norm > 0.0:
             v_[0] = radius * d_local[0] / d_radial_norm
             v_[1] = radius * d_local[1] / d_radial_norm
-    return gu.qd_transform_by_trans_quat_fast(v_, pos, quat)
+    return gu.qd_transform_by_trans_quat_fast(v_, pos, quat), v_
 
 
 @qd.func
@@ -407,15 +432,16 @@ def _func_support_prism(i_b: int, d: qd.types.vector(3), collider_state: Collide
 
 @qd.func
 def _func_support_box(
-    i_g: int, d: qd.types.vector(3), pos: qd.types.vector(3), quat: qd.types.vector(4), dyn_info: DynInfo
+    i_g: int, i_b: int, d: qd.types.vector(3), pos: qd.types.vector(3), quat: qd.types.vector(4), dyn_info: DynInfo
 ):
     d_box = gu.qd_inv_transform_by_quat(d, quat)
+    size = func_geom_size(i_g, i_b, dyn_info)
 
     v_ = qd.Vector(
         [
-            (-1.0 if d_box[0] < 0.0 else 1.0) * dyn_info.geoms.data[i_g][0] * 0.5,
-            (-1.0 if d_box[1] < 0.0 else 1.0) * dyn_info.geoms.data[i_g][1] * 0.5,
-            (-1.0 if d_box[2] < 0.0 else 1.0) * dyn_info.geoms.data[i_g][2] * 0.5,
+            (-1.0 if d_box[0] < 0.0 else 1.0) * size[0] * 0.5,
+            (-1.0 if d_box[1] < 0.0 else 1.0) * size[1] * 0.5,
+            (-1.0 if d_box[2] < 0.0 else 1.0) * size[2] * 0.5,
         ],
         dt=gs.qd_float,
     )
@@ -427,13 +453,21 @@ def _func_support_box(
 
 @qd.func
 def _func_count_supports_world(
-    i_g: int, d: qd.types.vector(3), quat: qd.types.vector(4), support_field_info: SupportFieldInfo
+    i_g: int,
+    i_b: int,
+    d: qd.types.vector(3),
+    quat: qd.types.vector(4),
+    dyn_info: DynInfo,
+    support_field_info: SupportFieldInfo,
 ):
     """
     Count the number of valid support points for the given world direction.
     Only needs quat since counting doesn't depend on position.
     """
     d_mesh = gu.qd_transform_by_quat_fast(d, gu.qd_inv_quat(quat))
+    if qd.static(len(dyn_info.geoms.design_idx.shape) == 1):
+        scale = func_mesh_scale(i_g, i_b, dyn_info)
+        d_mesh = (d_mesh * scale).normalized()
     return _func_count_supports_mesh(i_g, d_mesh, support_field_info)
 
 

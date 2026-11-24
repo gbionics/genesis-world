@@ -12,6 +12,8 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
+from genesis.engine.solvers.rigid.geometry import func_geom_local_point, func_geom_size
+
 from . import support_field
 from .contact import func_add_contact, func_compute_geom_pair_scale, rotaxis, rotmatx
 from .data import ColliderInfo, ColliderState
@@ -21,6 +23,7 @@ from .data import ColliderInfo, ColliderState
 def func_sphere_box_contact(
     i_ga: int,
     i_gb: int,
+    i_b: int,
     ga_pos: qd.types.vector(3),
     gb_pos: qd.types.vector(3),
     gb_quat: qd.types.vector(4),
@@ -45,11 +48,8 @@ def func_sphere_box_contact(
     sphere_center = ga_pos
     box_center = gb_pos
     box_quat = gb_quat
-    sphere_radius = dyn_info.geoms.data[i_ga][0]
-    box_half_size = qd.Vector(
-        [0.5 * dyn_info.geoms.data[i_gb][0], 0.5 * dyn_info.geoms.data[i_gb][1], 0.5 * dyn_info.geoms.data[i_gb][2]],
-        dt=gs.qd_float,
-    )
+    sphere_radius = func_geom_size(i_ga, i_b, dyn_info)[0]
+    box_half_size = 0.5 * func_geom_size(i_gb, i_b, dyn_info)
 
     # Express the sphere center in the box's local frame
     p_local = gu.qd_inv_transform_by_trans_quat(sphere_center, box_center, box_quat)
@@ -127,7 +127,7 @@ def func_plane_box_contact(
     plane_dir = gu.qd_transform_by_quat_fast(plane_dir, ga_quat)
     normal = -plane_dir.normalized()
 
-    v1, _, _ = support_field._func_support_box(i_gb, normal, gb_pos, gb_quat, dyn_info)
+    v1, _, _ = support_field._func_support_box(i_gb, i_b, normal, gb_pos, gb_quat, dyn_info)
     penetration = normal.dot(v1 - ga_pos)
 
     if penetration > 0.0:
@@ -153,13 +153,14 @@ def func_plane_box_contact(
             n_con = 1
             contact_pos_0 = contact_pos
             tolerance = collider_info.mc_tolerance[None] * func_compute_geom_pair_scale(
-                i_ga, i_gb, dyn_info, rigid_info
+                i_ga, i_gb, i_b, dyn_info, rigid_info
             )
             for i_v in range(dyn_info.geoms.vert_start[i_gb], dyn_info.geoms.vert_end[i_gb]):
                 # Plane-box pairs are sized with the convex cap (they are not in the large-contact mask), so the
                 # emission must stay within it to avoid overflowing a buffer allocated as a convex pair.
                 if n_con < qd.static(collider_config.n_contacts_per_convex_pair):
-                    pos_corner = gu.qd_transform_by_trans_quat_fast(dyn_info.verts.init_pos[i_v], gb_pos, gb_quat)
+                    local_pos = func_geom_local_point(i_gb, i_b, dyn_info.verts.init_pos[i_v], dyn_info, to_rest=False)
+                    pos_corner = gu.qd_transform_by_trans_quat_fast(local_pos, gb_pos, gb_quat)
                     penetration = normal.dot(pos_corner - ga_pos)
                     if penetration > 0.0:
                         contact_pos = pos_corner - 0.5 * penetration * normal

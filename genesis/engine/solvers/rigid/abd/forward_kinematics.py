@@ -21,6 +21,7 @@ import quadrants as qd
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.engine.solvers.rigid.data import DynInfo, DynState, RigidInfo
+from genesis.engine.solvers.rigid.geometry import func_geom_local_aabb, func_geom_local_point, func_geom_pos
 from genesis.grad.bridge import register_custom_backward
 from genesis.utils.data import eoa
 
@@ -56,7 +57,9 @@ def reverse_cartesian_space(envs, dyn_state, dyn_info, rigid_info, rigid_config)
     reverses read (see kernel_manual_forward_kinematics_bw).
     """
     envs_idx = torch.arange(dyn_state.links.pos.shape[1], dtype=gs.tc_int, device=gs.device)
-    kernel_forward_kinematics_replay(envs_idx, dyn_state, dyn_info, rigid_info, rigid_config, is_backward=True)
+    kernel_forward_kinematics_replay(
+        envs_idx, dyn_state, dyn_info, rigid_info, rigid_config, is_backward=True, neutral=False
+    )
     kernel_COM_links_replay(dyn_state, dyn_info, rigid_info, rigid_config)
     kernel_update_geoms_replay(dyn_state, dyn_info, rigid_info, rigid_config)
     kernel_forward_velocity(envs_idx, dyn_state, dyn_info, rigid_info, rigid_config, is_backward=True)
@@ -64,7 +67,7 @@ def reverse_cartesian_space(envs, dyn_state, dyn_info, rigid_info, rigid_config)
     kernel_manual_forward_velocity_bw(dyn_state, dyn_info, rigid_info, rigid_config)
     kernel_COM_links_replay.grad(dyn_state, dyn_info, rigid_info, rigid_config)
     kernel_update_geoms_replay.grad(dyn_state, dyn_info, rigid_info, rigid_config)
-    kernel_manual_forward_kinematics_bw(dyn_state, dyn_info, rigid_info, rigid_config)
+    kernel_manual_forward_kinematics_bw(dyn_state, dyn_info, rigid_info, rigid_config, neutral=False)
 
 
 def reverse_forward_velocity(envs, dyn_state, dyn_info, rigid_info, rigid_config, is_backward):
@@ -578,10 +581,8 @@ def func_update_geom_aabb(
     if is_carried:
         g_pos = dyn_state.geoms.pos[i_g, i_b]
         g_quat = dyn_state.geoms.quat[i_g, i_b]
-        # The first and last corners are the lower and upper ones (see kernel_init_geom_fields)
-        lower, upper = gu.qd_transform_aabb(
-            rigid_info.geoms_init_AABB[i_g, 0], rigid_info.geoms_init_AABB[i_g, 7], g_pos, g_quat
-        )
+        local_lower, local_upper = func_geom_local_aabb(i_g, i_b, dyn_info, rigid_info)
+        lower, upper = gu.qd_transform_aabb(local_lower, local_upper, g_pos, g_quat)
 
     dyn_state.geoms.aabb_min[i_g, i_b] = lower
     dyn_state.geoms.aabb_max[i_g, i_b] = upper
@@ -619,7 +620,7 @@ def func_update_geoms_link(
         if is_link_geom:
             if force_update_all_geoms or not dyn_info.geoms.is_fixed[i_g]:
                 dyn_state.geoms.pos[i_g, i_b], dyn_state.geoms.quat[i_g, i_b] = gu.qd_transform_pos_quat_by_trans_quat(
-                    dyn_info.geoms.pos[i_g],
+                    func_geom_pos(i_g, i_b, dyn_info),
                     dyn_info.geoms.quat[i_g],
                     dyn_state.links.pos[i_l, i_b],
                     dyn_state.links.quat[i_l, i_b],
@@ -683,7 +684,7 @@ def func_update_geoms(
             is_placed = is_placed and dyn_info.links.geom_start[I_l] <= i_g < dyn_info.links.geom_end[I_l]
         if is_placed and func_is_awake_link(i_l, i_b, dyn_state, rigid_config):
             dyn_state.geoms.pos[i_g, i_b], dyn_state.geoms.quat[i_g, i_b] = gu.qd_transform_pos_quat_by_trans_quat(
-                dyn_info.geoms.pos[i_g],
+                func_geom_pos(i_g, i_b, dyn_info),
                 dyn_info.geoms.quat[i_g],
                 dyn_state.links.pos[i_l, i_b],
                 dyn_state.links.quat[i_l, i_b],
@@ -957,8 +958,9 @@ def func_update_verts_for_geom(i_g: int, i_b: int, dyn_state: DynState, dyn_info
         else:
             for i_v in range(i_v_start, dyn_info.geoms.vert_end[i_g]):
                 verts_state_idx = dyn_info.verts.verts_state_idx[i_v]
+                local_pos = func_geom_local_point(i_g, i_b, dyn_info.verts.init_pos[i_v], dyn_info, to_rest=False)
                 dyn_state.free_verts.pos[verts_state_idx, i_b] = gu.qd_transform_by_trans_quat(
-                    dyn_info.verts.init_pos[i_v], dyn_state.geoms.pos[i_g, i_b], dyn_state.geoms.quat[i_g, i_b]
+                    local_pos, dyn_state.geoms.pos[i_g, i_b], dyn_state.geoms.quat[i_g, i_b]
                 )
             dyn_state.geoms.verts_updated[i_g, i_b] = True
 
@@ -1242,6 +1244,7 @@ def kernel_forward_kinematics_replay(
     rigid_info: RigidInfo,
     rigid_config: qd.template(),
     is_backward: qd.template(),
+    neutral: qd.template(),
 ):
     # No link sleeps under gradients, so the walk of every root covers every link
     qd.loop_config(serialize=qd.static(rigid_config.para_level < gs.PARA_LEVEL.PARTIAL))
@@ -1250,9 +1253,8 @@ def kernel_forward_kinematics_replay(
     ):
         i_b = qd.cast(envs_idx[i_b_], qd.i32)
         i_l_root = rigid_info.roots_link_idx[i_r]
-        func_forward_kinematics_root(
-            i_l_root, i_b, rigid_info.qpos, dyn_state, dyn_info, rigid_info, rigid_config, is_backward
-        )
+        qpos = qd.static(rigid_info.qpos0 if neutral else rigid_info.qpos)
+        func_forward_kinematics_root(i_l_root, i_b, qpos, dyn_state, dyn_info, rigid_info, rigid_config, is_backward)
 
 
 @qd.kernel(fastcache=True)
